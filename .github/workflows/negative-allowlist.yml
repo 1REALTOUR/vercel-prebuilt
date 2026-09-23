@@ -1,0 +1,16 @@
+name: negative-allowlist
+on:
+  push:
+    branches: [negative-allowlist]
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  deny:
+    uses: 1REALTOUR/vercel-prebuilt/.github/workflows/vercel-prebuilt.yml@main
+    with:
+      environment: preview
+      vercel_org_id: team_UALWOt3DTheRA6BwvmzIA2iD
+      vercel_project_id: prj_not_used
+      runner: org-1realtour-vercel-build
+      node_version: "22"
