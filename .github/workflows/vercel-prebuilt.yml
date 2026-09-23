@@ -269,7 +269,10 @@ jobs:
             vercel pull --yes --environment=preview
           fi
           find . .vercel -name '.env*' -type f 2>/dev/null | while read -r envfile; do
-            sed -i.bak -e 's/="\[SENSITIVE\]"/=""/' -e 's/=\[SENSITIVE\]$/=/' "$envfile"
+            sed -i.bak -E \
+              -e '/URL=/ s/="\[SENSITIVE\]"/=""/' \
+              -e '/URL=/ s/=\[SENSITIVE\]$/=/' \
+              "$envfile"
             rm -f "$envfile.bak"
           done
           if [ "$VERCEL_ENV" = "production" ]; then
