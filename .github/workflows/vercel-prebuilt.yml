@@ -2,7 +2,7 @@ name: vercel-prebuilt
 
 # Builds a Vercel project on BUILD-RUNNER and deploys the prebuilt output.
 # The Vercel token is read from Infisical with this job's GitHub OIDC token.
-# Identity vercel-prebuilt (d8200415-0edb-42f8-8adb-9e9f79c49b07) accepts only
+# Identity vercel-prebuilt (33dd5676-badc-4145-9d06-0d328d53e21f) accepts only
 # job_workflow_ref for this file on main, and can read only project vercel-deploy.
 
 on:
@@ -33,6 +33,11 @@ on:
         required: false
         type: string
         default: "24"
+      install_command:
+        description: Vercel project install command. Empty uses the lockfile.
+        required: false
+        type: string
+        default: ""
       runner:
         description: GitHub Actions runner label. Personal repositories pass their j1v scale set.
         required: true
@@ -175,15 +180,35 @@ jobs:
           npm install -g vercel@59.25.4
           vercel --version
 
-      - name: Install dependencies
+      - name: Detect Bun
+        id: bun
+        env:
+          INSTALL_COMMAND: ${{ inputs.install_command }}
         run: |
           set -euo pipefail
-          if [ -f pnpm-lock.yaml ]; then
+          if printf '%s' "$INSTALL_COMMAND" | grep -q bun; then echo "need=true" >> "$GITHUB_OUTPUT"
+          elif [ -f bun.lock ] || [ -f bun.lockb ]; then echo "need=true" >> "$GITHUB_OUTPUT"
+          else echo "need=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Bun
+        if: steps.bun.outputs.need == 'true'
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+
+      - name: Install dependencies
+        env:
+          INSTALL_COMMAND: ${{ inputs.install_command }}
+        run: |
+          set -euo pipefail
+          if [ -n "$INSTALL_COMMAND" ]; then
+            bash -lc "$INSTALL_COMMAND"
+          elif [ -f pnpm-lock.yaml ]; then
             PM="$(node -p "require('./package.json').packageManager || ''")"
             if [ -n "$PM" ]; then corepack prepare "$PM" --activate
             else corepack prepare pnpm@10.34.5 --activate
             fi
             pnpm install --frozen-lockfile
+          elif [ -f bun.lock ] || [ -f bun.lockb ]; then bun install --frozen-lockfile
           elif [ -f package-lock.json ]; then npm ci
           elif [ -f yarn.lock ]; then corepack prepare yarn@1.22.22 --activate && yarn install --frozen-lockfile
           else npm install
