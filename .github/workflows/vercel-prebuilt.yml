@@ -263,24 +263,18 @@ jobs:
             done
             return 1
           }
-          deploy_prebuilt() {
-            local attempt
-            for attempt in 1 2 3; do
-              if [ "$VERCEL_ENV" = "production" ]; then
-                vercel deploy --prebuilt --prod --archive=tgz > "$RUNNER_TEMP/deploy-url.txt" && return 0
-              else
-                vercel deploy --prebuilt --archive=tgz > "$RUNNER_TEMP/deploy-url.txt" && return 0
-              fi
-              echo "prebuilt deploy attempt ${attempt} failed"
-              sleep 20
-            done
-            return 1
-          }
           if [ "$VERCEL_ENV" = "production" ]; then
             vercel pull --yes --environment=production
-            vercel build --prod
           else
             vercel pull --yes --environment=preview
+          fi
+          find . .vercel -name '.env*' -type f 2>/dev/null | while read -r envfile; do
+            sed -i.bak -e 's/="\[SENSITIVE\]"/=""/' -e 's/=\[SENSITIVE\]$/=/' "$envfile"
+            rm -f "$envfile.bak"
+          done
+          if [ "$VERCEL_ENV" = "production" ]; then
+            vercel build --prod
+          else
             vercel build
           fi
           deploy_prebuilt
