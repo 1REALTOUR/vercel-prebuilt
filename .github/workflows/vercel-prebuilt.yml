@@ -1,0 +1,284 @@
+name: vercel-prebuilt
+
+# Builds a Vercel project on BUILD-RUNNER and deploys the prebuilt output.
+# The Vercel token is read from Infisical with this job's GitHub OIDC token.
+# Identity vercel-prebuilt (d8200415-0edb-42f8-8adb-9e9f79c49b07) accepts only
+# job_workflow_ref for this file on main, and can read only project vercel-deploy.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: proof runs a connectivity check. deploy is unused here; repositories call this workflow.
+        type: string
+        default: proof
+  workflow_call:
+    inputs:
+      environment:
+        description: preview or production
+        required: true
+        type: string
+      vercel_org_id:
+        required: true
+        type: string
+      vercel_project_id:
+        required: true
+        type: string
+      root_directory:
+        required: false
+        type: string
+        default: "."
+      node_version:
+        description: Major Node version from the Vercel project settings.
+        required: false
+        type: string
+        default: "24"
+      runner:
+        description: GitHub Actions runner label. Personal repositories pass their j1v scale set.
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+  deployments: write
+  statuses: write
+
+concurrency:
+  group: vercel-prebuilt-${{ github.repository }}-${{ github.event_name == 'workflow_call' && inputs.environment || 'proof' }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' || inputs.environment != 'production' }}
+
+jobs:
+  proof:
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'proof'
+    runs-on: org-1realtour-vercel-build
+    timeout-minutes: 10
+    steps:
+      - name: Show the runner and test egress
+        run: |
+          set -euo pipefail
+          echo "host=$(hostname)"
+          echo "node=$(uname -n)"
+          if [ -f /sys/fs/cgroup/memory.max ]; then echo "memory_max=$(cat /sys/fs/cgroup/memory.max)"; fi
+          probe() {
+            local spec="$1" expect="$2"
+            local host="${spec%:*}" port="${spec##*:}"
+            if timeout 5 bash -c "echo >/dev/tcp/${host}/${port}" 2>/dev/null; then
+              got=OPEN
+            else
+              got=CLOSED
+            fi
+            echo "$spec $got expected $expect"
+            [ "$got" = "$expect" ]
+          }
+          probe 23.95.65.10:22 CLOSED
+          probe 23.95.65.10:5432 CLOSED
+          probe 100.99.55.167:5433 CLOSED
+          probe 192.200.112.194:53211 CLOSED
+          probe 104.168.7.138:22 CLOSED
+          probe github.com:443 OPEN
+          probe registry.npmjs.org:443 OPEN
+          probe api.vercel.com:443 OPEN
+          probe secrets.1realtour.icu:443 OPEN
+          test ! -S /var/run/docker.sock
+          test ! -S /run/k3s/containerd/containerd.sock
+
+  deploy:
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ${{ inputs.runner }}
+    environment: ${{ inputs.environment }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: ${{ inputs.root_directory }}
+    steps:
+      - name: Refuse forks and repositories outside the allowlist
+        working-directory: .
+        env:
+          ALLOWLIST: |
+            1REALTOUR/1realtour
+            1REALTOUR/1realtour-minimal
+            1REALTOUR/1realtour-new
+            1REALTOUR/1realtourpms_frontend
+            1REALTOUR/ariainteriorfinishes
+            1REALTOUR/baystonedepot
+            1REALTOUR/buildly-demo
+            1REALTOUR/craft-website
+            1REALTOUR/dermalactives
+            1REALTOUR/dermaltives-ui-example
+            1REALTOUR/elleconstructionusa
+            1REALTOUR/glc-kitchen-and-bath-remodeling
+            1REALTOUR/golden-painters
+            1REALTOUR/goldenline-construction
+            1REALTOUR/gs-holding
+            1REALTOUR/hertitage
+            1REALTOUR/kiland-design
+            1REALTOUR/kirbywood
+            1REALTOUR/lumina-builders
+            1REALTOUR/lumina-payload
+            1REALTOUR/mbk_remodel
+            1REALTOUR/orangegarageanddoors
+            1REALTOUR/primo
+            1REALTOUR/rhdesignandconstruction
+            1REALTOUR/rnrbackyardremodeling
+            1REALTOUR/sagahomeremodeling
+            1REALTOUR/silver-hammer
+            1REALTOUR/smstudioinc
+            1REALTOUR/studiomoth-payload
+            1REALTOUR/uclazoo
+            1REALTOUR/vitalitea
+            1REALTOUR/vitalitea-payload
+            josephasmith1/berk100
+            josephasmith1/coffee-ucla-private
+            josephasmith1/da-d-architecture
+            josephasmith1/dermalactives-ecommerce
+            josephasmith1/dermalactives-mx
+            josephasmith1/hillel-digital
+            josephasmith1/hillel-graph-site
+            josephasmith1/hydrogen-2
+            josephasmith1/lumina-builders-crm
+            josephasmith1/mbk-portfolio
+            josephasmith1/modern-arab-apparel
+            josephasmith1/nationaldebtrelief
+            josephasmith1/nextjs
+            josephasmith1/nextjs-commerce
+            josephasmith1/payload-website-starter
+            josephasmith1/portfolio-project
+            josephasmith1/precision-sd-nextjs
+            josephasmith1/sveltekit-commerce
+            josephasmith1/treeium-website
+            josephasmith1/wintorium-website
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ] || [ -n "${{ github.event.pull_request.number }}" ]; then
+            if [ "${{ github.event.pull_request.head.repo.full_name }}" != "${{ github.repository }}" ]; then
+              echo "fork pull requests do not receive deployment credentials"
+              exit 1
+            fi
+          fi
+          printf '%s\n' "$ALLOWLIST" | sed 's/^[[:space:]]*//' > "$RUNNER_TEMP/allowlist.txt"
+          grep -Fxq "${{ github.repository }}" "$RUNNER_TEMP/allowlist.txt"
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: ${{ inputs.node_version || '24' }}
+
+      - name: Install pnpm and the pinned Vercel CLI
+        run: |
+          set -euo pipefail
+          corepack enable
+          npm install -g vercel@59.25.4
+          vercel --version
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          if [ -f pnpm-lock.yaml ]; then
+            PM="$(node -p "require('./package.json').packageManager || ''")"
+            if [ -n "$PM" ]; then corepack prepare "$PM" --activate
+            else corepack prepare pnpm@10.34.5 --activate
+            fi
+            pnpm install --frozen-lockfile
+          elif [ -f package-lock.json ]; then npm ci
+          elif [ -f yarn.lock ]; then corepack prepare yarn@1.22.22 --activate && yarn install --frozen-lockfile
+          else npm install
+          fi
+
+      - name: Read the Vercel token from Infisical
+        env:
+          INFISICAL_IDENTITY_ID: PUBLIC_IDENTITY_PENDING
+          INFISICAL_PROJECT_ID: d58fa688-73c8-4145-b4f2-0d14eb2c4853
+        run: |
+          set -euo pipefail
+          JWT="$(curl -sf -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https://secrets.1realtour.icu" | jq -r .value)"
+          if [ -z "$JWT" ] || [ "$JWT" = "null" ]; then echo "OIDC token was not issued"; exit 1; fi
+          echo "::add-mask::$JWT"
+          ACCESS="$(jq -n --arg i "$INFISICAL_IDENTITY_ID" --arg j "$JWT" '{identityId:$i, jwt:$j}' \
+            | curl -sf -X POST https://secrets.1realtour.icu/api/v1/auth/oidc-auth/login \
+              -H 'Content-Type: application/json' --data-binary @- | jq -r '.accessToken // empty')"
+          if [ -z "$ACCESS" ]; then echo "Infisical OIDC login failed"; exit 1; fi
+          echo "::add-mask::$ACCESS"
+          RAW="$(curl -sf -H "Authorization: Bearer $ACCESS" \
+            "https://secrets.1realtour.icu/api/v4/secrets/VERCEL_API_TOKEN?projectId=${INFISICAL_PROJECT_ID}&environment=prod&secretPath=/&viewSecretValue=true")"
+          VALUE="$(printf '%s' "$RAW" | jq -r '.secret.secretValue // .secretValue // empty')"
+          if [ -z "$VALUE" ]; then echo "Vercel credential was not returned"; exit 1; fi
+          echo "::add-mask::$VALUE"
+          echo "VERCEL_TOKEN=$VALUE" >> "$GITHUB_ENV"
+
+      - name: Build and deploy the prebuilt output
+        env:
+          VERCEL_ORG_ID: ${{ inputs.vercel_org_id }}
+          VERCEL_PROJECT_ID: ${{ inputs.vercel_project_id }}
+          VERCEL: "1"
+          VERCEL_ENV: ${{ inputs.environment }}
+          VERCEL_GIT_PROVIDER: github
+          VERCEL_GIT_COMMIT_SHA: ${{ github.sha }}
+          VERCEL_GIT_COMMIT_REF: ${{ github.ref_name }}
+          VERCEL_GIT_REPO_OWNER: ${{ github.repository_owner }}
+          VERCEL_GIT_REPO_SLUG: ${{ github.event.repository.name }}
+          VERCEL_GIT_PULL_REQUEST_ID: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          if [ "$VERCEL_ENV" = "production" ]; then
+            vercel pull --yes --environment=production
+            vercel build --prod
+            vercel deploy --prebuilt --prod --archive=tgz > "$RUNNER_TEMP/deploy-url.txt"
+          else
+            vercel pull --yes --environment=preview
+            vercel build
+            vercel deploy --prebuilt --archive=tgz > "$RUNNER_TEMP/deploy-url.txt"
+          fi
+          URL="$(grep -Eo 'https://[^ ]+' "$RUNNER_TEMP/deploy-url.txt" | tail -1)"
+          if [ -z "$URL" ]; then echo "deploy did not print a URL"; exit 1; fi
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "deployment_url=$URL" >> "$GITHUB_ENV"
+
+      - name: Record the GitHub deployment
+        if: success()
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          ENV_NAME: ${{ inputs.environment }}
+          SERVER: ${{ github.server_url }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          DEPLOY="$(jq -n --arg ref "$SHA" --arg env "$ENV_NAME" \
+            '{ref:$ref, environment:$env, auto_merge:false, required_contexts:[], description:"prebuilt on BUILD-RUNNER"}')"
+          ID="$(curl -fsS -X POST -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/deployments" -d "$DEPLOY" | jq -r .id)"
+          curl -fsS -X POST -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/deployments/${ID}/statuses" \
+            -d "$(jq -n --arg url "$deployment_url" --arg log "${SERVER}/${REPO}/actions/runs/${RUN_ID}" \
+              '{state:"success", environment_url:$url, log_url:$log, description:"prebuilt deployment"}')" >/dev/null
+
+      - name: Smoke the deployment URL
+        if: success()
+        run: |
+          set -euo pipefail
+          headers="$(mktemp)"
+          code="$(curl -s -D "$headers" -o /dev/null -w '%{http_code}' "$deployment_url")"
+          loc="$(awk 'BEGIN{IGNORECASE=1} /^location:/{print $2}' "$headers" | tr -d '\r')"
+          rm -f "$headers"
+          echo "smoke $deployment_url $code"
+          case "$code" in
+            200|307|308) ;;
+            302) case "$loc" in https://vercel.com/sso-api*) echo "deployment protection is enabled" ;; *) exit 1 ;; esac ;;
+            *) exit 1 ;;
+          esac
+
+      - name: Remove credentials and the workspace
+        if: always()
+        run: |
+          set -euo pipefail
+          rm -rf .vercel .env .env.local .env.production .env.preview "$RUNNER_TEMP/deploy-url.txt" || true
+          rm -f ~/.npmrc ~/.pnpmrc || true
+          cd "$GITHUB_WORKSPACE" && rm -rf ./* ./.??* || true
