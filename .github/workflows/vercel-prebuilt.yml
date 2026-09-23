@@ -211,7 +211,8 @@ jobs:
           elif [ -f bun.lock ] || [ -f bun.lockb ]; then bun install --frozen-lockfile
           elif [ -f package-lock.json ]; then npm ci
           elif [ -f yarn.lock ]; then corepack prepare yarn@1.22.22 --activate && yarn install --frozen-lockfile
-          else npm install
+          elif [ -f package.json ]; then npm install
+          else echo "static project: no package.json to install"
           fi
 
       - name: Read the Vercel token from Infisical
