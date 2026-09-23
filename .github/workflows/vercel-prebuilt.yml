@@ -250,15 +250,27 @@ jobs:
           VERCEL_GIT_PULL_REQUEST_ID: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
+          deploy_prebuilt() {
+            local attempt
+            for attempt in 1 2 3; do
+              if [ "$VERCEL_ENV" = "production" ]; then
+                vercel deploy --prebuilt --prod --archive=tgz > "$RUNNER_TEMP/deploy-url.txt" && return 0
+              else
+                vercel deploy --prebuilt --archive=tgz > "$RUNNER_TEMP/deploy-url.txt" && return 0
+              fi
+              echo "prebuilt deploy attempt ${attempt} failed"
+              sleep 20
+            done
+            return 1
+          }
           if [ "$VERCEL_ENV" = "production" ]; then
             vercel pull --yes --environment=production
             vercel build --prod
-            vercel deploy --prebuilt --prod --archive=tgz > "$RUNNER_TEMP/deploy-url.txt"
           else
             vercel pull --yes --environment=preview
             vercel build
-            vercel deploy --prebuilt --archive=tgz > "$RUNNER_TEMP/deploy-url.txt"
           fi
+          deploy_prebuilt
           URL="$(grep -Eo 'https://[^ ]+' "$RUNNER_TEMP/deploy-url.txt" | tail -1)"
           if [ -z "$URL" ]; then echo "deploy did not print a URL"; exit 1; fi
           echo "url=$URL" >> "$GITHUB_OUTPUT"
