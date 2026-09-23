@@ -270,8 +270,8 @@ jobs:
           fi
           find . .vercel -name '.env*' -type f 2>/dev/null | while read -r envfile; do
             sed -i.bak -E \
-              -e '/URL=/ s/="\[SENSITIVE\]"/=""/' \
-              -e '/URL=/ s/=\[SENSITIVE\]$/=/' \
+              -e '/^NEXT_PUBLIC_.*=/ s/="\[SENSITIVE\]"/=""/' \
+              -e '/^NEXT_PUBLIC_.*=/ s/=\[SENSITIVE\]$/=/' \
               "$envfile"
             rm -f "$envfile.bak"
           done
