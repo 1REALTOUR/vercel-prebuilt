@@ -191,7 +191,7 @@ jobs:
 
       - name: Read the Vercel token from Infisical
         env:
-          INFISICAL_IDENTITY_ID: PUBLIC_IDENTITY_PENDING
+          INFISICAL_IDENTITY_ID: 33dd5676-badc-4145-9d06-0d328d53e21f
           INFISICAL_PROJECT_ID: d58fa688-73c8-4145-b4f2-0d14eb2c4853
         run: |
           set -euo pipefail
