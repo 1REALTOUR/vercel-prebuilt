@@ -14,5 +14,5 @@ jobs:
       environment: preview
       vercel_org_id: team_UALWOt3DTheRA6BwvmzIA2iD
       vercel_project_id: prj_not_used
-      runner: org-1realtour-vercel-build
+      runner: ubuntu-latest
       node_version: "22"
