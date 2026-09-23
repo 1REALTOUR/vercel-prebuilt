@@ -263,6 +263,19 @@ jobs:
             done
             return 1
           }
+          deploy_prebuilt() {
+            local attempt
+            for attempt in 1 2 3; do
+              if [ "$VERCEL_ENV" = "production" ]; then
+                vercel deploy --prebuilt --prod --archive=tgz > "$RUNNER_TEMP/deploy-url.txt" && return 0
+              else
+                vercel deploy --prebuilt --archive=tgz > "$RUNNER_TEMP/deploy-url.txt" && return 0
+              fi
+              echo "prebuilt deploy attempt ${attempt} failed"
+              sleep 20
+            done
+            return 1
+          }
           if [ "$VERCEL_ENV" = "production" ]; then
             vercel pull --yes --environment=production
             vercel build --prod
