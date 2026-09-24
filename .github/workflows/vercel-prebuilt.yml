@@ -197,11 +197,13 @@ jobs:
           url="https://api.github.com/repos/$REPO/tarball/$SHA"
           # No curl --retry: a retried transfer would be appended to the same tar stream.
           # Retry the whole download into an emptied workspace instead.
-          for attempt in 1 2 3; do
+          for attempt in 1 2; do
             find "$GITHUB_WORKSPACE" -mindepth 1 -delete
             start=$(date +%s)
-            # A stall (<100 KB/s for 60 s) fails fast so the next attempt fits in the job.
-            if curl -fsSL --connect-timeout 30 --speed-limit 102400 --speed-time 60 --max-time 1200 \
+            # A new connection often gets a different path: on 2026-09-24 the same 1.5 GB archive
+            # took 45+ min at 07:41 and 78 s at 08:27. Give up on a slow transfer (<1 MB/s for
+            # 90 s, or >15 min) so the second attempt still fits inside the 45-min job.
+            if curl -fsSL --connect-timeout 30 --speed-limit 1048576 --speed-time 90 --max-time 900 \
                 -H "Authorization: Bearer $GH_TOKEN" "$url" \
                 | tar -xz --strip-components=1 -C "$GITHUB_WORKSPACE"; then
               echo "source archive extracted in $(( $(date +%s) - start ))s: $(du -sm "$GITHUB_WORKSPACE" | cut -f1) MB (attempt $attempt)"
