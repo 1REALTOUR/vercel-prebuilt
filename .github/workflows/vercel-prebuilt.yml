@@ -42,6 +42,14 @@ on:
         description: GitHub Actions runner label. Personal repositories pass their j1v scale set.
         required: true
         type: string
+      infisical_project_id:
+        description: >-
+          Infisical project that holds this app's env (production -> prod, preview -> staging).
+          When set, every "[SENSITIVE]" placeholder written by `vercel pull` is replaced with the
+          real value from Infisical before `vercel build`, and the build fails if any remain.
+        required: false
+        type: string
+        default: ""
 
 permissions:
   id-token: write
@@ -230,6 +238,7 @@ jobs:
               -H 'Content-Type: application/json' --data-binary @- | jq -r '.accessToken // empty')"
           if [ -z "$ACCESS" ]; then echo "Infisical OIDC login failed"; exit 1; fi
           echo "::add-mask::$ACCESS"
+          echo "INFISICAL_ACCESS_TOKEN=$ACCESS" >> "$GITHUB_ENV"
           RAW="$(curl -sf -H "Authorization: Bearer $ACCESS" \
             "https://secrets.1realtour.icu/api/v4/secrets/VERCEL_API_TOKEN?projectId=${INFISICAL_PROJECT_ID}&environment=prod&secretPath=/&viewSecretValue=true")"
           VALUE="$(printf '%s' "$RAW" | jq -r '.secret.secretValue // .secretValue // empty')"
@@ -249,6 +258,7 @@ jobs:
           VERCEL_GIT_REPO_OWNER: ${{ github.repository_owner }}
           VERCEL_GIT_REPO_SLUG: ${{ github.event.repository.name }}
           VERCEL_GIT_PULL_REQUEST_ID: ${{ github.event.pull_request.number }}
+          APP_INFISICAL_PROJECT_ID: ${{ inputs.infisical_project_id }}
         run: |
           set -euo pipefail
           deploy_prebuilt() {
@@ -269,13 +279,52 @@ jobs:
           else
             vercel pull --yes --environment=preview
           fi
-          find . .vercel -name '.env*' -type f 2>/dev/null | while read -r envfile; do
-            sed -i.bak -E \
-              -e '/^NEXT_PUBLIC_.*=/ s/="\[SENSITIVE\]"/=""/' \
-              -e '/^NEXT_PUBLIC_.*=/ s/=\[SENSITIVE\]$/=/' \
-              "$envfile"
-            rm -f "$envfile.bak"
-          done
+          if [ -n "$APP_INFISICAL_PROJECT_ID" ]; then
+            # [2026-09-24] Since the Infisical->Vercel push every var is sensitive, so `vercel pull`
+            # writes "[SENSITIVE]" for all of them and anything read at build time (NEXT_PUBLIC_*,
+            # next.config `env:`) was baked as a placeholder. Fill them from Infisical instead.
+            if [ "$VERCEL_ENV" = "production" ]; then INF_ENV=prod; else INF_ENV=staging; fi
+            curl -sf -H "Authorization: Bearer $INFISICAL_ACCESS_TOKEN" \
+              "https://secrets.1realtour.icu/api/v3/secrets/raw?workspaceId=${APP_INFISICAL_PROJECT_ID}&environment=${INF_ENV}&secretPath=/&viewSecretValue=true" \
+              > "$RUNNER_TEMP/infisical-env.json" \
+              || { echo "could not read Infisical project ${APP_INFISICAL_PROJECT_ID}/${INF_ENV}"; exit 1; }
+            find . .vercel -name '.env*' -type f 2>/dev/null | while read -r envfile; do
+              python3 - "$envfile" "$RUNNER_TEMP/infisical-env.json" <<'PY'
+          import json, re, sys
+          path, src = sys.argv[1], sys.argv[2]
+          values = {s["secretKey"]: s["secretValue"] for s in json.load(open(src)).get("secrets", [])}
+          out, filled, missing = [], 0, []
+          for line in open(path).read().splitlines():
+              m = re.match(r'^([A-Za-z_][A-Za-z0-9_]*)="?\[SENSITIVE\]"?$', line)
+              if m:
+                  key = m.group(1)
+                  if key in values:
+                      v = values[key].replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+                      line = f'{key}="{v}"'
+                      filled += 1
+                  else:
+                      missing.append(key)
+              out.append(line)
+          open(path, "w").write("\n".join(out) + "\n")
+          print(f"{path}: filled {filled} placeholder(s) from Infisical")
+          if missing:
+              print(f"{path}: no Infisical value for: {', '.join(missing)}")
+              sys.exit(1)
+          PY
+            done
+            rm -f "$RUNNER_TEMP/infisical-env.json"
+            if grep -rl '\[SENSITIVE\]' .vercel/.env* .env* 2>/dev/null; then
+              echo "a [SENSITIVE] placeholder is still present after the Infisical fill"; exit 1
+            fi
+          else
+            find . .vercel -name '.env*' -type f 2>/dev/null | while read -r envfile; do
+              sed -i.bak -E \
+                -e '/^NEXT_PUBLIC_.*=/ s/="\[SENSITIVE\]"/=""/' \
+                -e '/^NEXT_PUBLIC_.*=/ s/=\[SENSITIVE\]$/=/' \
+                "$envfile"
+              rm -f "$envfile.bak"
+            done
+          fi
           if [ "$VERCEL_ENV" = "production" ]; then
             vercel build --prod
           else
