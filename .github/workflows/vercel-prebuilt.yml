@@ -42,6 +42,15 @@ on:
         description: GitHub Actions runner label. Personal repositories pass their j1v scale set.
         required: true
         type: string
+      source_archive:
+        description: >-
+          Fetch the commit as a source archive (codeload CDN) instead of a git checkout.
+          For repositories with a very large tree: on 2026-09-24 BUILD-RUNNER pulled from
+          github.com git at 0.7 MB/s but from codeload at 4.6 MB/s. Commit metadata comes
+          from VERCEL_GIT_* env, so no .git directory is needed.
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   id-token: write
@@ -164,10 +173,24 @@ jobs:
           printf '%s\n' "$ALLOWLIST" | sed 's/^[[:space:]]*//' > "$RUNNER_TEMP/allowlist.txt"
           grep -Fxq "${{ github.repository }}" "$RUNNER_TEMP/allowlist.txt"
 
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - if: ${{ !inputs.source_archive }}
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: ${{ github.repository }}
           ref: ${{ github.sha }}
+
+      - name: Fetch the commit as a source archive
+        if: ${{ inputs.source_archive }}
+        working-directory: ${{ github.workspace }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          start=$(date +%s)
+          curl -fsSL --retry 3 --max-time 2400 -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/tarball/${{ github.sha }}" \
+            | tar -xz --strip-components=1 -C "$GITHUB_WORKSPACE"
+          echo "source archive extracted in $(( $(date +%s) - start ))s: $(du -sm "$GITHUB_WORKSPACE" | cut -f1) MB"
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
