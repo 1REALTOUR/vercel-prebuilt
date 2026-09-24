@@ -59,9 +59,14 @@ permissions:
   deployments: write
   statuses: write
 
+# In a called workflow, github.event_name is the CALLER's event (push, pull_request, schedule),
+# never 'workflow_call' (GitHub docs: "the github context is always associated with the caller
+# workflow"). Keying on it put every run in one '-proof' group with cancel-in-progress, so a PR
+# preview cancelled a running production deploy (precision-sd run 35968150138, 2026-09-24).
+# inputs.environment is set only for workflow_call runs.
 concurrency:
-  group: vercel-prebuilt-${{ github.repository }}-${{ github.event_name == 'workflow_call' && inputs.environment || 'proof' }}
-  cancel-in-progress: ${{ github.event_name != 'workflow_call' || inputs.environment != 'production' }}
+  group: vercel-prebuilt-${{ github.repository }}-${{ inputs.environment || 'proof' }}
+  cancel-in-progress: ${{ inputs.environment != 'production' }}
 
 jobs:
   proof:
