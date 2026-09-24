@@ -236,6 +236,9 @@ jobs:
           if [ -z "$VALUE" ]; then echo "Vercel credential was not returned"; exit 1; fi
           echo "::add-mask::$VALUE"
           echo "VERCEL_TOKEN=$VALUE" >> "$GITHUB_ENV"
+          # Kept for the build step: it reads this app's values from its Infisical mirror.
+          ( umask 077; printf '%s' "$ACCESS" > "$RUNNER_TEMP/infisical-prebuilt.token" )
+          echo "INFISICAL_ACCESS_FILE=$RUNNER_TEMP/infisical-prebuilt.token" >> "$GITHUB_ENV"
 
       - name: Build and deploy the prebuilt output
         env:
@@ -264,18 +267,80 @@ jobs:
             done
             return 1
           }
+          # Build values come from Infisical, the source of truth (decision 2026-09-23). Vercel
+          # never returns `sensitive` values; `vercel pull` writes "[SENSITIVE]" for them unless
+          # the env file already holds a local value, which it keeps ("Kept N existing local
+          # values" - measured on a throwaway project 2026-09-23). So the file is written first
+          # from the app's Infisical mirror, then pulled. Values are never printed.
+          python3 - <<'PY'
+          import json, os, re, urllib.error, urllib.parse, urllib.request
+          API = "https://secrets.1realtour.icu"
+          target = os.environ["VERCEL_ENV"]
+          env = {"production": "prod", "preview": "staging"}[target]
+          def get(url, token):
+              req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      return r.status, json.loads(r.read() or b"{}")
+              except urllib.error.HTTPError as e:
+                  return e.code, {}
+          code, proj = get(f"https://api.vercel.com/v9/projects/{os.environ['VERCEL_PROJECT_ID']}"
+                           f"?teamId={os.environ['VERCEL_ORG_ID']}", os.environ["VERCEL_TOKEN"])
+          name = proj.get("name", "") if code == 200 else ""
+          # Same slug rule as bin/infisical-vercel-bootstrap slugify().
+          slug = re.sub(r"-{2,}", "-", re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-"))[:60]
+          slug = slug if len(slug) >= 5 else f"{slug}-vercel"
+          token = open(os.environ["INFISICAL_ACCESS_FILE"]).read().strip()
+          code, p = get(f"{API}/api/v1/projects/slug/{slug}", token)
+          pid = (p.get("project") or p).get("id") if code == 200 else None
+          if not pid:
+              print(f"::warning::no readable Infisical mirror for {name or '?'} (slug {slug}, "
+                    f"HTTP {code}); sensitive values stay Vercel placeholders")
+              raise SystemExit(0)
+          qs = urllib.parse.urlencode({"workspaceId": pid, "environment": env, "secretPath": "/"})
+          code, r = get(f"{API}/api/v3/secrets/raw?{qs}", token)
+          if code != 200:
+              print(f"::warning::Infisical {slug} {env} not readable (HTTP {code}); using Vercel values")
+              raise SystemExit(0)
+          vals = {s["secretKey"]: s.get("secretValue") or "" for s in r.get("secrets", [])}
+          # Only the keys Vercel hides from `vercel pull` for this target: this fills the
+          # placeholders and nothing else (a key deleted in Vercel must not come back).
+          code, e = get(f"https://api.vercel.com/v9/projects/{os.environ['VERCEL_PROJECT_ID']}/env"
+                        f"?limit=500&teamId={os.environ['VERCEL_ORG_ID']}", os.environ["VERCEL_TOKEN"])
+          hidden = {v["key"] for v in e.get("envs", []) if v.get("type") == "sensitive"
+                    and target in (v.get("target") or []) and not v.get("gitBranch")}
+          vals = {k: v for k, v in vals.items() if v and k in hidden}
+          missing = sorted(hidden - set(vals))
+          if missing:
+              print(f"::warning::{len(missing)} sensitive keys have no value in Infisical {slug} {env}: {missing}")
+          def esc(v):  # the Vercel CLI's own escapeValue(): only \n and \r
+              return v.replace("\n", "\\n").replace("\r", "\\r")
+          os.makedirs(".vercel", exist_ok=True)
+          path = os.path.join(".vercel", ".env." + target + ".local")
+          fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+          with os.fdopen(fd, "w") as f:
+              f.write("# Created by Vercel CLI\n")
+              f.writelines(f'{k}="{esc(v)}"\n' for k, v in sorted(vals.items()))
+          print(f"Infisical {slug} {env}: {len(vals)} of {len(hidden)} sensitive values written before vercel pull")
+          PY
           if [ "$VERCEL_ENV" = "production" ]; then
             vercel pull --yes --environment=production
           else
             vercel pull --yes --environment=preview
           fi
-          find . .vercel -name '.env*' -type f 2>/dev/null | while read -r envfile; do
-            sed -i.bak -E \
-              -e '/^NEXT_PUBLIC_.*=/ s/="\[SENSITIVE\]"/=""/' \
-              -e '/^NEXT_PUBLIC_.*=/ s/=\[SENSITIVE\]$/=/' \
-              "$envfile"
-            rm -f "$envfile.bak"
-          done
+          # (The former blanking of NEXT_PUBLIC_* "[SENSITIVE]" placeholders is gone: it shipped
+          # builds with empty public keys. Values are seeded from Infisical; any placeholder left
+          # stops the build below.)
+          # Refuse to build with a placeholder. Since 2026-09-24 every production/preview variable is
+          # sensitive (Infisical pushes them), so a value Infisical could not seed arrives as
+          # "[SENSITIVE]" and would be baked into the build: PMS production served 500 on
+          # 2026-09-24 02:09Z for exactly this reason.
+          left="$(grep -l '\[SENSITIVE\]' .vercel/.env.*.local 2>/dev/null | head -1 || true)"
+          if [ -n "$left" ]; then
+            n="$(grep -c '\[SENSITIVE\]' "$left" || true)"
+            echo "::error::$n environment values are still the [SENSITIVE] placeholder after seeding from Infisical — refusing to build. Grant this build identity Viewer on the project's Infisical mirror (bin/infisical-vercel-bootstrap memberships)."
+            exit 1
+          fi
           if [ "$VERCEL_ENV" = "production" ]; then
             vercel build --prod
           else
@@ -328,5 +393,6 @@ jobs:
         run: |
           set -euo pipefail
           rm -rf .vercel .env .env.local .env.production .env.preview "$RUNNER_TEMP/deploy-url.txt" || true
+          rm -f "$RUNNER_TEMP/infisical-prebuilt.token" || true
           rm -f ~/.npmrc ~/.pnpmrc || true
           cd "$GITHUB_WORKSPACE" && rm -rf ./* ./.??* || true
