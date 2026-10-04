@@ -299,13 +299,26 @@ jobs:
           VERCEL_GIT_PULL_REQUEST_ID: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
+          # A paused Vercel project accepts the upload and leaves the deployment BLOCKED
+          # ("couldn't be built because the project was paused"); the CLI then waits on it until
+          # the job timeout. Measured 2026-10-04 on 1realtour-old. Refuse before building.
+          paused="$(curl -fsS --max-time 20 -H "Authorization: Bearer $VERCEL_TOKEN" \
+            "https://api.vercel.com/v9/projects/${VERCEL_PROJECT_ID}?teamId=${VERCEL_ORG_ID}" \
+            | jq -r '.paused // false')" || paused=unknown
+          if [ "$paused" = "true" ]; then
+            echo "::error::Vercel project ${VERCEL_PROJECT_ID} is paused, so Vercel would block this deployment. Unpause the project in Vercel, or stop deploying this repository."
+            exit 1
+          fi
+          if [ "$paused" = "unknown" ]; then echo "::warning::could not read the Vercel project's paused state; continuing"; fi
           deploy_prebuilt() {
             local attempt
             for attempt in 1 2 3; do
+              # Each attempt is bounded: the CLI waits for the deployment to be ready and never
+              # gives up on its own (2026-10-04: two previews held a runner 44 min each).
               if [ "$VERCEL_ENV" = "production" ]; then
-                vercel deploy --prebuilt --prod --archive=tgz > "$RUNNER_TEMP/deploy-url.txt" && return 0
+                timeout --kill-after=30 600 vercel deploy --prebuilt --prod --archive=tgz > "$RUNNER_TEMP/deploy-url.txt" && return 0
               else
-                vercel deploy --prebuilt --archive=tgz > "$RUNNER_TEMP/deploy-url.txt" && return 0
+                timeout --kill-after=30 600 vercel deploy --prebuilt --archive=tgz > "$RUNNER_TEMP/deploy-url.txt" && return 0
               fi
               echo "prebuilt deploy attempt ${attempt} failed"
               sleep 20
