@@ -8,7 +8,10 @@ permissions:
   statuses: write
 jobs:
   deny:
-    uses: 1REALTOUR/vercel-prebuilt/.github/workflows/vercel-prebuilt.yml@main
+    # Local reference: a PR's probe must test THAT PR's version of the workflow, not main's.
+    # The refusal path never reaches the Infisical exchange, so the identity's main-only
+    # job_workflow_ref binding is irrelevant here.
+    uses: ./.github/workflows/vercel-prebuilt.yml
     with:
       environment: preview
       vercel_org_id: team_UALWOt3DTheRA6BwvmzIA2iD

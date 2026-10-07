@@ -104,7 +104,19 @@ jobs:
           test ! -S /run/k3s/containerd/containerd.sock
 
   deploy:
-    if: github.event_name != 'workflow_dispatch'
+    # Refuse BEFORE a runner is requested (2026-10-06): the checks below used to run only as the
+    # first step, i.e. after a self-hosted build runner had accepted the job. A disallowed caller
+    # (a fork pull request, or a repository not on this list) therefore still asked for the
+    # runner; from a public repository the org runner group never accepts it, so the job sat
+    # "queued" until cancelled. fork-probe showed exactly that on every PR here (runs
+    # 35969399235 ... 37560861569, all cancelled by hand). GitHub evaluates this `if` itself, so a
+    # refused call is "skipped" immediately and no runner or credential is involved. This list is
+    # the single allowlist; the first step re-checks forks as defense in depth.
+    if: >-
+      github.event_name != 'workflow_dispatch'
+      && (github.event.pull_request == null
+          || github.event.pull_request.head.repo.full_name == github.repository)
+      && contains(fromJSON('["1REALTOUR/1realtour","1REALTOUR/1realtour-minimal","1REALTOUR/1realtour-new","1REALTOUR/1realtourpms_frontend","1REALTOUR/ariainteriorfinishes","1REALTOUR/baystonedepot","1REALTOUR/buildly-demo","1REALTOUR/craft-website","1REALTOUR/dermalactives","1REALTOUR/dermaltives-ui-example","1REALTOUR/elleconstructionusa","1REALTOUR/glc-kitchen-and-bath-remodeling","1REALTOUR/golden-painters","1REALTOUR/goldenline-construction","1REALTOUR/gs-holding","1REALTOUR/hertitage","1REALTOUR/kiland-design","1REALTOUR/kirbywood","1REALTOUR/lumina-builders","1REALTOUR/lumina-payload","1REALTOUR/mbk_remodel","1REALTOUR/orangegarageanddoors","1REALTOUR/primo","1REALTOUR/rhdesignandconstruction","1REALTOUR/rnrbackyardremodeling","1REALTOUR/sagahomeremodeling","1REALTOUR/silver-hammer","1REALTOUR/smstudioinc","1REALTOUR/studiomoth-payload","1REALTOUR/uclazoo","1REALTOUR/vitalitea","1REALTOUR/vitalitea-payload","josephasmith1/berk100","josephasmith1/coffee-ucla-private","josephasmith1/da-d-architecture","josephasmith1/dermalactives-ecommerce","josephasmith1/dermalactives-mx","josephasmith1/hillel-digital","josephasmith1/hillel-graph-site","josephasmith1/hydrogen-2","josephasmith1/lumina-builders-crm","josephasmith1/mbk-portfolio","josephasmith1/modern-arab-apparel","josephasmith1/nationaldebtrelief","josephasmith1/nextjs","josephasmith1/nextjs-commerce","josephasmith1/payload-website-starter","josephasmith1/portfolio-project","josephasmith1/precision-sd-nextjs","josephasmith1/sveltekit-commerce","josephasmith1/treeium-website","josephasmith1/wintorium-website"]'), github.repository)
     runs-on: ${{ inputs.runner }}
     environment: ${{ inputs.environment }}
     timeout-minutes: 45
@@ -112,62 +124,8 @@ jobs:
       run:
         working-directory: ${{ inputs.root_directory }}
     steps:
-      - name: Refuse forks and repositories outside the allowlist
+      - name: Refuse fork pull requests (defense in depth; the job `if` already refuses them)
         working-directory: .
-        env:
-          ALLOWLIST: |
-            1REALTOUR/1realtour
-            1REALTOUR/1realtour-minimal
-            1REALTOUR/1realtour-new
-            1REALTOUR/1realtourpms_frontend
-            1REALTOUR/ariainteriorfinishes
-            1REALTOUR/baystonedepot
-            1REALTOUR/buildly-demo
-            1REALTOUR/craft-website
-            1REALTOUR/dermalactives
-            1REALTOUR/dermaltives-ui-example
-            1REALTOUR/elleconstructionusa
-            1REALTOUR/glc-kitchen-and-bath-remodeling
-            1REALTOUR/golden-painters
-            1REALTOUR/goldenline-construction
-            1REALTOUR/gs-holding
-            1REALTOUR/hertitage
-            1REALTOUR/kiland-design
-            1REALTOUR/kirbywood
-            1REALTOUR/lumina-builders
-            1REALTOUR/lumina-payload
-            1REALTOUR/mbk_remodel
-            1REALTOUR/orangegarageanddoors
-            1REALTOUR/primo
-            1REALTOUR/rhdesignandconstruction
-            1REALTOUR/rnrbackyardremodeling
-            1REALTOUR/sagahomeremodeling
-            1REALTOUR/silver-hammer
-            1REALTOUR/smstudioinc
-            1REALTOUR/studiomoth-payload
-            1REALTOUR/uclazoo
-            1REALTOUR/vitalitea
-            1REALTOUR/vitalitea-payload
-            josephasmith1/berk100
-            josephasmith1/coffee-ucla-private
-            josephasmith1/da-d-architecture
-            josephasmith1/dermalactives-ecommerce
-            josephasmith1/dermalactives-mx
-            josephasmith1/hillel-digital
-            josephasmith1/hillel-graph-site
-            josephasmith1/hydrogen-2
-            josephasmith1/lumina-builders-crm
-            josephasmith1/mbk-portfolio
-            josephasmith1/modern-arab-apparel
-            josephasmith1/nationaldebtrelief
-            josephasmith1/nextjs
-            josephasmith1/nextjs-commerce
-            josephasmith1/payload-website-starter
-            josephasmith1/portfolio-project
-            josephasmith1/precision-sd-nextjs
-            josephasmith1/sveltekit-commerce
-            josephasmith1/treeium-website
-            josephasmith1/wintorium-website
         run: |
           set -euo pipefail
           if [ "${{ github.event_name }}" = "pull_request" ] || [ -n "${{ github.event.pull_request.number }}" ]; then
@@ -176,8 +134,6 @@ jobs:
               exit 1
             fi
           fi
-          printf '%s\n' "$ALLOWLIST" | sed 's/^[[:space:]]*//' > "$RUNNER_TEMP/allowlist.txt"
-          grep -Fxq "${{ github.repository }}" "$RUNNER_TEMP/allowlist.txt"
 
       - if: ${{ !inputs.source_archive }}
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
