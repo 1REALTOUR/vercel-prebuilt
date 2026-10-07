@@ -310,8 +310,21 @@ jobs:
             exit 1
           fi
           if [ "$paused" = "unknown" ]; then echo "::warning::could not read the Vercel project's paused state; continuing"; fi
+          # Deployment Vercel already created for this commit since this step started:
+          # "<state> https://<url>", or "" when there is none (or the API is unreachable).
+          deploy_started_ms="$(( $(date +%s) * 1000 ))"
+          existing_deployment() {
+            local target_q=""
+            if [ "$VERCEL_ENV" = "production" ]; then target_q="&target=production"; fi
+            curl -fsS --max-time 20 -H "Authorization: Bearer $VERCEL_TOKEN" \
+              "https://api.vercel.com/v6/deployments?projectId=${VERCEL_PROJECT_ID}&teamId=${VERCEL_ORG_ID}&sha=${VERCEL_GIT_COMMIT_SHA}&since=${deploy_started_ms}&limit=5${target_q}" \
+              | jq -r '[.deployments[] | select(.meta.githubCommitSha == env.VERCEL_GIT_COMMIT_SHA)]
+                       | sort_by(.created) | last
+                       | if . == null then "" else "\(.state // .readyState) https://\(.url)" end' \
+              || true
+          }
           deploy_prebuilt() {
-            local attempt
+            local attempt found state url poll
             for attempt in 1 2 3; do
               # Each attempt is bounded: the CLI waits for the deployment to be ready and never
               # gives up on its own (2026-10-04: two previews held a runner 44 min each).
@@ -321,6 +334,28 @@ jobs:
                 timeout --kill-after=30 600 vercel deploy --prebuilt --archive=tgz > "$RUNNER_TEMP/deploy-url.txt" && return 0
               fi
               echo "prebuilt deploy attempt ${attempt} failed"
+              # The CLI can fail AFTER Vercel has created (and, with --prod, promoted) the
+              # deployment: 2026-10-06 dermalactives-ecommerce run 37550444323 uploaded 632MB,
+              # printed "Error: fetch failed" on all 3 attempts, and failed the job while
+              # dpl_ApvsjMgDPWh37rNXvPCWzNKLqAWa was READY in production. Adopt that deployment
+              # instead of failing or uploading a duplicate; wait while it is still building.
+              for poll in $(seq 1 24); do
+                found="$(existing_deployment)"
+                state="${found%% *}"
+                url="${found#* }"
+                case "$state" in
+                  READY)
+                    echo "$url" > "$RUNNER_TEMP/deploy-url.txt"
+                    echo "::warning::vercel deploy reported a failure, but Vercel created $url for this commit and it is READY; using it."
+                    return 0
+                    ;;
+                  BUILDING | INITIALIZING | QUEUED)
+                    echo "deployment for this commit is $state; waiting (${poll}/24)"
+                    sleep 20
+                    ;;
+                  *) break ;;
+                esac
+              done
               sleep 20
             done
             return 1
