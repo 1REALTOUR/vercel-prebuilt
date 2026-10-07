@@ -390,6 +390,15 @@ jobs:
             echo "::error::$n environment values are still the [SENSITIVE] placeholder after seeding from Infisical — refusing to build. Grant this build identity Viewer on the project's Infisical mirror (bin/infisical-vercel-bootstrap memberships)."
             exit 1
           fi
+          # Skew Protection for prebuilt deploys. Vercel only pins an open tab to its own build when
+          # the build carries a deployment ID (written to routes-manifest.json; Vercel changelog
+          # 2026-01-28 "Skew Protection now supports prebuilt deployments"). Without one, Next.js
+          # emits no ?dpl= on chunk URLs, so every deploy breaks tabs opened before it: lazily loaded
+          # chunks 404 ("Failed to load chunk /_next/static/chunks/..."). Seen on dermalactives.com
+          # 2026-10-07 on the admin Reports Export button. Next.js reads NEXT_DEPLOYMENT_ID into
+          # config.deploymentId (next/dist/server/config.js); other frameworks ignore it. Unique per
+          # run attempt, so a rebuild never shares an ID with different chunks.
+          export NEXT_DEPLOYMENT_ID="gh-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           if [ "$VERCEL_ENV" = "production" ]; then
             vercel build --prod
           else
