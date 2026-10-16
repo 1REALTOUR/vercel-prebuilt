@@ -64,8 +64,14 @@ permissions:
 # workflow"). Keying on it put every run in one '-proof' group with cancel-in-progress, so a PR
 # preview cancelled a running production deploy (precision-sd run 35968150138, 2026-09-24).
 # inputs.environment is set only for workflow_call runs.
+#
+# Previews are grouped per caller ref (github.ref is the CALLER's ref, e.g. refs/pull/216/merge):
+# one shared '-preview' group made every PR's preview cancel every other PR's running preview
+# in the same repository (dermalactives-ecommerce #216/#217, 2026-10-16: three PRs in CI meant
+# no preview ever finished). A new push still cancels only that PR's older preview. Production
+# keeps one uncancellable group per repository.
 concurrency:
-  group: vercel-prebuilt-${{ github.repository }}-${{ inputs.environment || 'proof' }}
+  group: vercel-prebuilt-${{ github.repository }}-${{ inputs.environment || 'proof' }}${{ inputs.environment == 'preview' && format('-{0}', github.ref) || '' }}
   cancel-in-progress: ${{ inputs.environment != 'production' }}
 
 jobs:
