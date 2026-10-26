@@ -52,6 +52,19 @@ on:
         required: false
         type: boolean
         default: false
+      integration_keys_unused_at_build:
+        description: >-
+          Space-separated production/preview keys a Vercel integration provisions (the env
+          record carries contentHint or configurationId) that this project's build never reads.
+          Infisical holds no same-name copy of integration keys (owner standard 2026-10-24), so
+          `vercel pull` writes "[SENSITIVE]" for them; the keys listed here are written empty
+          instead of stopping the build, so a listed key the build does read is empty in the build
+          output. Runtime still gets the integration's value from Vercel.
+          A key the build does read is supplied as VERCEL_BUILD_<KEY> in the app's Infisical
+          mirror (owner direction 2026-10-26), never listed here.
+        required: false
+        type: string
+        default: ""
 
 permissions:
   id-token: write
@@ -259,6 +272,7 @@ jobs:
           VERCEL_GIT_REPO_OWNER: ${{ github.repository_owner }}
           VERCEL_GIT_REPO_SLUG: ${{ github.event.repository.name }}
           VERCEL_GIT_PULL_REQUEST_ID: ${{ github.event.pull_request.number }}
+          INTEGRATION_KEYS_UNUSED_AT_BUILD: ${{ inputs.integration_keys_unused_at_build }}
         run: |
           set -euo pipefail
           # A paused Vercel project accepts the upload and leaves the deployment BLOCKED
@@ -357,14 +371,34 @@ jobs:
           if code != 200:
               print(f"::warning::Infisical {slug} {env} not readable (HTTP {code}); using Vercel values")
               raise SystemExit(0)
-          vals = {s["secretKey"]: s.get("secretValue") or "" for s in r.get("secrets", [])}
+          every = {s["secretKey"]: s.get("secretValue") or "" for s in r.get("secrets", [])}
           # Only the keys Vercel hides from `vercel pull` for this target: this fills the
           # placeholders and nothing else (a key deleted in Vercel must not come back).
           code, e = get(f"https://api.vercel.com/v9/projects/{os.environ['VERCEL_PROJECT_ID']}/env"
                         f"?limit=500&teamId={os.environ['VERCEL_ORG_ID']}", os.environ["VERCEL_TOKEN"])
-          hidden = {v["key"] for v in e.get("envs", []) if v.get("type") == "sensitive"
-                    and target in (v.get("target") or []) and not v.get("gitBranch")}
-          vals = {k: v for k, v in vals.items() if v and k in hidden}
+          rows = [v for v in e.get("envs", []) if v.get("type") == "sensitive"
+                  and target in (v.get("target") or []) and not v.get("gitBranch")]
+          hidden = {v["key"] for v in rows}
+          vals = {k: v for k, v in every.items() if v and k in hidden}
+          # Keys a Vercel integration provisions (contentHint / configurationId on the env record)
+          # have no same-name copy in Infisical since the 2026-10-24 owner standard. A build that
+          # reads one gets the build-only copy VERCEL_BUILD_<KEY>; a key the caller declares unused
+          # at build is written empty. Any other missing key still stops the build below.
+          integration = {v["key"] for v in rows if v.get("contentHint") or v.get("configurationId")}
+          unused = set(os.environ.get("INTEGRATION_KEYS_UNUSED_AT_BUILD", "").split())
+          from_build_copy, blanked = [], []
+          for k in sorted(integration - set(vals)):
+              if every.get(f"VERCEL_BUILD_{k}"):
+                  vals[k] = every[f"VERCEL_BUILD_{k}"]
+                  from_build_copy.append(k)
+              elif k in unused:
+                  blanked.append(k)
+          if from_build_copy:
+              print(f"integration-owned keys from their VERCEL_BUILD_ copy: {from_build_copy}")
+          if blanked:
+              print(f"integration-owned keys declared unused at build, written empty: {blanked}")
+          with open(os.path.join(os.environ["RUNNER_TEMP"], "integration-blank.txt"), "w") as f:
+              f.writelines(f"{k}\n" for k in blanked)
           missing = sorted(hidden - set(vals))
           if missing:
               print(f"::warning::{len(missing)} sensitive keys have no value in Infisical {slug} {env}: {missing}")
@@ -383,6 +417,22 @@ jobs:
           else
             vercel pull --yes --environment=preview
           fi
+          # Integration-owned keys the caller declared unused at build: if the pull wrote the
+          # placeholder for them, empty it. (No list file when the app has no readable mirror.)
+          python3 - <<'PY'
+          import glob, os
+          listed = os.path.join(os.environ["RUNNER_TEMP"], "integration-blank.txt")
+          names = set(open(listed).read().split()) if os.path.exists(listed) else set()
+          if not names:
+              raise SystemExit(0)
+          for path in glob.glob(".vercel/.env.*.local"):
+              lines = open(path, newline="").read().splitlines(True)
+              out = [f'{l.split("=", 1)[0]}=""\n' if l.split("=", 1)[0] in names and "[SENSITIVE]" in l else l
+                     for l in lines]
+              fd = os.open(path, os.O_WRONLY | os.O_TRUNC)
+              with os.fdopen(fd, "w", newline="") as f:
+                  f.writelines(out)
+          PY
           # (The former blanking of NEXT_PUBLIC_* "[SENSITIVE]" placeholders is gone: it shipped
           # builds with empty public keys. Values are seeded from Infisical; any placeholder left
           # stops the build below.)
