@@ -63,20 +63,6 @@ on:
         required: false
         type: string
         default: ""
-      integration_keys_unused_at_build:
-        description: >-
-          DEPRECATED alias of blank_sensitive_keys (space-separated); removed once no caller uses it.
-          Space-separated production/preview keys a Vercel integration provisions (the env
-          record carries contentHint or configurationId) that this project's build never reads.
-          Infisical holds no same-name copy of integration keys (owner standard 2026-10-24), so
-          `vercel pull` writes "[SENSITIVE]" for them; the keys listed here are written empty
-          instead of stopping the build, so a listed key the build does read is empty in the build
-          output. Runtime still gets the integration's value from Vercel.
-          A key the build does read is supplied as VERCEL_BUILD_<KEY> in the app's Infisical
-          mirror (owner direction 2026-10-26), never listed here.
-        required: false
-        type: string
-        default: ""
 
 permissions:
   id-token: write
@@ -285,7 +271,6 @@ jobs:
           VERCEL_GIT_REPO_SLUG: ${{ github.event.repository.name }}
           VERCEL_GIT_PULL_REQUEST_ID: ${{ github.event.pull_request.number }}
           BLANK_SENSITIVE_KEYS: ${{ inputs.blank_sensitive_keys }}
-          INTEGRATION_KEYS_UNUSED_AT_BUILD: ${{ inputs.integration_keys_unused_at_build }}
         run: |
           set -euo pipefail
           # A paused Vercel project accepts the upload and leaves the deployment BLOCKED
@@ -389,7 +374,6 @@ jobs:
           # integration-provisioned key the build never reads): seeded as "" only when Vercel hides
           # them and Infisical holds them empty, or they are integration-provisioned with no copy.
           declared = {k.strip() for k in os.environ.get("BLANK_SENSITIVE_KEYS", "").split(",") if k.strip()}
-          declared |= set(os.environ.get("INTEGRATION_KEYS_UNUSED_AT_BUILD", "").split())
           # Only the keys Vercel hides from `vercel pull` for this target: this fills the
           # placeholders and nothing else (a key deleted in Vercel must not come back).
           code, e = get(f"https://api.vercel.com/v9/projects/{os.environ['VERCEL_PROJECT_ID']}/env"
