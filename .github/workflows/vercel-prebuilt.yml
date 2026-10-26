@@ -58,7 +58,8 @@ on:
           record carries contentHint or configurationId) that this project's build never reads.
           Infisical holds no same-name copy of integration keys (owner standard 2026-10-24), so
           `vercel pull` writes "[SENSITIVE]" for them; the keys listed here are written empty
-          instead of stopping the build. Runtime still gets the integration's value from Vercel.
+          instead of stopping the build, so a listed key the build does read is empty in the build
+          output. Runtime still gets the integration's value from Vercel.
           A key the build does read is supplied as VERCEL_BUILD_<KEY> in the app's Infisical
           mirror (owner direction 2026-10-26), never listed here.
         required: false
@@ -422,12 +423,14 @@ jobs:
           import glob, os
           listed = os.path.join(os.environ["RUNNER_TEMP"], "integration-blank.txt")
           names = set(open(listed).read().split()) if os.path.exists(listed) else set()
+          if not names:
+              raise SystemExit(0)
           for path in glob.glob(".vercel/.env.*.local"):
-              lines = open(path).read().splitlines(True)
+              lines = open(path, newline="").read().splitlines(True)
               out = [f'{l.split("=", 1)[0]}=""\n' if l.split("=", 1)[0] in names and "[SENSITIVE]" in l else l
                      for l in lines]
               fd = os.open(path, os.O_WRONLY | os.O_TRUNC)
-              with os.fdopen(fd, "w") as f:
+              with os.fdopen(fd, "w", newline="") as f:
                   f.writelines(out)
           PY
           # (The former blanking of NEXT_PUBLIC_* "[SENSITIVE]" placeholders is gone: it shipped
