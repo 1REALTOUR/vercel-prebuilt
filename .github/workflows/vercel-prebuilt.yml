@@ -313,7 +313,13 @@ jobs:
               # printed "Error: fetch failed" on all 3 attempts, and failed the job while
               # dpl_ApvsjMgDPWh37rNXvPCWzNKLqAWa was READY in production. Adopt that deployment
               # instead of failing or uploading a duplicate; wait while it is still building.
-              for poll in $(seq 1 24); do
+              # Once Vercel has created a deployment for this commit, never upload again: the build
+              # carries NEXT_DEPLOYMENT_ID, and Vercel rejects a second deployment with the same ID
+              # ("A deployment with the user-configured deploymentId ... already exists").
+              # 2026-11-05 dermalactives-ecommerce run 42078474067: the deployment sat QUEUED past
+              # the old 8-minute wait, both re-uploads were refused, and the job failed while the
+              # deployment later went READY. So wait for the one that exists (up to 20 minutes).
+              for poll in $(seq 1 60); do
                 found="$(existing_deployment)"
                 state="${found%% *}"
                 url="${found#* }"
@@ -324,12 +330,23 @@ jobs:
                     return 0
                     ;;
                   BUILDING | INITIALIZING | QUEUED)
-                    echo "deployment for this commit is $state; waiting (${poll}/24)"
+                    echo "deployment for this commit is $state; waiting (${poll}/60)"
                     sleep 20
                     ;;
-                  *) break ;;
+                  "")
+                    # No deployment was created, so a new upload can use the ID.
+                    break
+                    ;;
+                  *)
+                    echo "::error::Vercel created $url for this commit and it ended $state. A new upload would reuse its deployment ID and be refused."
+                    return 1
+                    ;;
                 esac
               done
+              if [ -n "$state" ]; then
+                echo "::error::the deployment for this commit was still $state after 20 minutes of waiting."
+                return 1
+              fi
               sleep 20
             done
             return 1
