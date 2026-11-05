@@ -136,7 +136,7 @@ jobs:
       && contains(fromJSON('["1REALTOUR/1realtour","1REALTOUR/1realtour-minimal","1REALTOUR/1realtour-new","1REALTOUR/1realtourpms_frontend","1REALTOUR/ariainteriorfinishes","1REALTOUR/baystonedepot","1REALTOUR/buildly-demo","1REALTOUR/craft-website","1REALTOUR/dermalactives","1REALTOUR/dermaltives-ui-example","1REALTOUR/elleconstructionusa","1REALTOUR/glc-kitchen-and-bath-remodeling","1REALTOUR/golden-painters","1REALTOUR/goldenline-construction","1REALTOUR/gs-holding","1REALTOUR/hertitage","1REALTOUR/kiland-design","1REALTOUR/kirbywood","1REALTOUR/lumina-builders","1REALTOUR/lumina-payload","1REALTOUR/mbk_remodel","1REALTOUR/orangegarageanddoors","1REALTOUR/primo","1REALTOUR/rhdesignandconstruction","1REALTOUR/rnrbackyardremodeling","1REALTOUR/sagahomeremodeling","1REALTOUR/silver-hammer","1REALTOUR/smstudioinc","1REALTOUR/studiomoth-payload","1REALTOUR/uclazoo","1REALTOUR/vitalitea","1REALTOUR/vitalitea-payload","josephasmith1/berk100","josephasmith1/coffee-ucla-private","josephasmith1/da-d-architecture","josephasmith1/dermalactives-ecommerce","josephasmith1/dermalactives-mx","josephasmith1/hillel-digital","josephasmith1/hillel-graph-site","josephasmith1/hydrogen-2","josephasmith1/lumina-builders-crm","josephasmith1/mbk-portfolio","josephasmith1/modern-arab-apparel","josephasmith1/nationaldebtrelief","josephasmith1/nextjs","josephasmith1/nextjs-commerce","josephasmith1/payload-website-starter","josephasmith1/portfolio-project","josephasmith1/precision-sd-nextjs","josephasmith1/sveltekit-commerce","josephasmith1/treeium-website","josephasmith1/wintorium-website"]'), github.repository)
     runs-on: ${{ inputs.runner }}
     environment: ${{ inputs.environment }}
-    timeout-minutes: 45
+    timeout-minutes: 60
     defaults:
       run:
         working-directory: ${{ inputs.root_directory }}
@@ -285,7 +285,7 @@ jobs:
           fi
           if [ "$paused" = "unknown" ]; then echo "::warning::could not read the Vercel project's paused state; continuing"; fi
           # Deployment Vercel already created for this commit since this step started:
-          # "<state> https://<url>", or "" when there is none (or the API is unreachable).
+          # "<state> https://<url>", "" when there is none, or "UNKNOWN lookup-failed" when the API call fails.
           deploy_started_ms="$(( $(date +%s) * 1000 ))"
           existing_deployment() {
             local target_q=""
@@ -295,7 +295,7 @@ jobs:
               | jq -r '[.deployments[] | select(.meta.githubCommitSha == env.VERCEL_GIT_COMMIT_SHA)]
                        | sort_by(.created) | last
                        | if . == null then "" else "\(.state // .readyState) https://\(.url)" end' \
-              || true
+              || echo "UNKNOWN lookup-failed"
           }
           deploy_prebuilt() {
             local attempt found state url poll
@@ -320,6 +320,11 @@ jobs:
               # the old 8-minute wait, both re-uploads were refused, and the job failed while the
               # deployment later went READY. So wait for the one that exists (up to 20 minutes).
               for poll in $(seq 1 60); do
+                # Stop waiting with our own error before the 60-minute job limit kills the step.
+                if [ $(( $(date +%s) - deploy_started_ms / 1000 )) -gt 2700 ]; then
+                  echo "::error::the deployment for this commit was still ${state:-unknown} after 45 minutes in this step."
+                  return 1
+                fi
                 found="$(existing_deployment)"
                 state="${found%% *}"
                 url="${found#* }"
@@ -329,7 +334,7 @@ jobs:
                     echo "::warning::vercel deploy reported a failure, but Vercel created $url for this commit and it is READY; using it."
                     return 0
                     ;;
-                  BUILDING | INITIALIZING | QUEUED)
+                  BUILDING | INITIALIZING | QUEUED | UNKNOWN)
                     echo "deployment for this commit is $state; waiting (${poll}/60)"
                     sleep 20
                     ;;
