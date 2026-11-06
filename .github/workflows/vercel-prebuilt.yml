@@ -4,6 +4,30 @@ name: vercel-prebuilt
 # The Vercel token is read from Infisical with this job's GitHub OIDC token.
 # Identity vercel-prebuilt (33dd5676-badc-4145-9d06-0d328d53e21f) accepts only
 # job_workflow_ref for this file on main, and can read only project vercel-deploy.
+#
+# CANONICAL SOURCE — 1REALTOUR/1realtour-fleet-ops
+#   deploy/vercel-prebuilt/public-variant/vercel-prebuilt.yml
+# The copy at 1REALTOUR/vercel-prebuilt/.github/workflows/vercel-prebuilt.yml is
+# PUBLISHED FROM THIS FILE (one writer: Fleet Ops) and is never edited by hand.
+# bin/fleet-verify check `vercel-prebuilt-public-projection` FAILs when the
+# published blob differs from these bytes. Runbook:
+# docs/runbooks/vercel-prebuilt-public-variant.md
+#
+# SHARED-IDENTITY RULE (the PMS 16445 vector, public half): Infisical binds
+# identity 33dd5676 to this workflow FILE on refs/heads/main, not to the calling
+# repository, and that identity reads the shared Vercel reader project
+# (d58fa688-73c8-4145-b4f2-0d14eb2c4853 — the team-level VERCEL_API_TOKEN). So no
+# dependency lifecycle script may run here: every package-manager install below
+# passes --ignore-scripts, and a caller-supplied install_command runs with
+# NPM_CONFIG_IGNORE_SCRIPTS=true (Bun documents the same variable:
+# bun.com/docs/pm/cli/install, "Lifecycle Script Management"). An explicit step a
+# caller writes (prisma generate and friends) still runs; only install-time
+# lifecycle hooks are disabled. The variable is documented only from Bun 1.4.4
+# and is a no-op on older releases, so a custom command that invokes Bun is
+# refused unless the Bun that the login shell actually resolves is the stable
+# executable the pinned setup action installed, at that floor or later (see the
+# install step: the action's `bun-version`/`bun-path` outputs are checked inside
+# the same login shell, immediately before the command).
 
 on:
   workflow_dispatch:
@@ -63,6 +87,45 @@ on:
         required: false
         type: string
         default: ""
+      source_map_capture:
+        description: >-
+          Capture this build's JavaScript source maps as a private run artifact BEFORE the Vercel
+          production deployment (contract mx-private-source-map-artifact, schemaVersion 1).
+          Accepted only from josephasmith1/dermalactives-mx on a push to refs/heads/main in the
+          production environment; any other caller that sets true is refused before the source is
+          fetched and before a credential is read. Default false leaves every existing caller
+          unchanged (no map, no artifact step, no strip).
+        required: false
+        type: boolean
+        default: false
+      content_task:
+        description: >-
+          Fixed Precision staging CMS custody task, run from josephasmith1/precision-sd-nextjs's
+          wordpress-content.yml workflow_dispatch on refs/heads/staging only. Allowed value:
+          cms-login-custody. Empty (the default for every existing caller) skips the job entirely.
+        required: false
+        type: string
+        default: ""
+      content_apply:
+        description: >-
+          With content_task: false runs the custody task as a dry run (nothing written, no handoff
+          password read); true writes, after the same run has printed the machine-readable plan
+          and the fresh target readback.
+        required: false
+        type: boolean
+        default: false
+      content_expected_head:
+        description: >-
+          With content_task: the raw expected_head dispatch input the ONE fixed caller
+          (josephasmith1/precision-sd-nextjs wordpress-content.yml on refs/heads/staging)
+          received and forwards here. The bind step requires it to be a full lowercase
+          40-hex SHA byte-equal to both the caller's raw github.event.inputs.expected_head
+          and this run's own github.sha BEFORE any source fetch or credential read. Empty
+          (the default) is inert for every existing caller: they never set content_task,
+          so the job never runs.
+        required: false
+        type: string
+        default: ""
 
 permissions:
   id-token: write
@@ -81,8 +144,12 @@ permissions:
 # in the same repository (dermalactives-ecommerce #216/#217, 2026-10-16: three PRs in CI meant
 # no preview ever finished). A new push still cancels only that PR's older preview. Production
 # keeps one uncancellable group per repository.
+# A content run is not a preview of the same ref: it holds the runner for a custody
+# plan/apply, so it gets its own group instead of cancelling (or being cancelled by)
+# a preview build of the branch it happens to be dispatched on. Same suffix rule as
+# the org workflow's website-content-task job.
 concurrency:
-  group: vercel-prebuilt-${{ github.repository }}-${{ inputs.environment || 'proof' }}${{ inputs.environment == 'preview' && format('-{0}', github.ref) || '' }}
+  group: vercel-prebuilt-${{ github.repository }}-${{ inputs.environment || 'proof' }}${{ inputs.environment == 'preview' && format('-{0}', github.ref) || '' }}${{ inputs.content_task != '' && format('-content-{0}', inputs.content_task) || '' }}
   cancel-in-progress: ${{ inputs.environment != 'production' }}
 
 jobs:
@@ -120,6 +187,547 @@ jobs:
           test ! -S /var/run/docker.sock
           test ! -S /run/k3s/containerd/containerd.sock
 
+  # Fixed Precision staging CMS login custody (task cms-login-custody). This job never
+  # builds and never deploys: it is keyed to exactly one private caller repository
+  # (josephasmith1/precision-sd-nextjs, repository id 1072367530, owner actor 6611890)
+  # dispatching its own wordpress-content.yml on refs/heads/staging, and the deploy job
+  # below already excludes workflow_dispatch, so a content run cannot reach a Vercel
+  # deployment.
+  #
+  # It runs the REAL product CLI (scripts/cms-custody.mjs on the dispatched commit): the
+  # read-only `plan` mode first, then exactly one of the modes that plan selected
+  # (ensure-first-admin | create-team-user | rotate). `manual-review` is never turned
+  # into a write, and the handoff password is read only after the plan succeeded.
+  #
+  # The immutable head binding is two-sided and RAW: the caller's
+  # github.event.inputs.expected_head (what the dispatcher typed), the forwarded
+  # content_expected_head input, and this run's own github.sha must all be the same
+  # full lowercase 40-hex SHA, checked in the bind step BEFORE the checkout and before
+  # any credential is read. Deriving the expected head from github.sha alone would be
+  # tautological; the raw input is never derived, only compared.
+  #
+  # Authorities are NOT caller inputs: the Infisical project, the environment, the
+  # secret paths, the designated address, the staging database selector and the preview
+  # origin are fixed literals in this file, and the runner is a literal label. The only
+  # caller inputs are the task name (allowlist of one), the apply boolean and the
+  # forwarded head string (which must equal the run's own sha to have any effect).
+  website-content-task:
+    if: >-
+      inputs.content_task != ''
+      && github.repository == 'josephasmith1/precision-sd-nextjs'
+      && github.repository_id == 1072367530
+      && github.event.repository.id == 1072367530
+      && github.event.repository.private == true
+      && github.event_name == 'workflow_dispatch'
+      && github.ref == 'refs/heads/staging'
+      && github.actor_id == '6611890'
+    runs-on: j1v-precision-sd-nextjs
+    timeout-minutes: 45
+    env:
+      CMS_CUSTODY_EMAIL: 1realtourteam@1realtour.com
+      CMS_CUSTODY_PROJECT_ID: 5fef3c0e-4ff2-4dfb-8d51-4d0f346da22d
+      INFISICAL_IDENTITY_ID: 33dd5676-badc-4145-9d06-0d328d53e21f
+      # The preview origin that native Vercel metadata reported READY
+      # (dpl_UQhA5P3p2JQBQiAVyJRhbVPD2qbY, 2026-11-05). It is the origin the staging
+      # branch built and the HTTP login check below talks to; it is NOT an execution
+      # authority for any database, which stays bound to the module's fixed selector.
+      CMS_CUSTODY_VERIFY_ORIGIN: https://precision-sd-nextjs-njatpmaft-joseph-smiths-projects-662e73b8.vercel.app
+      # The product module's fixed staging allowlist of one (CMS_CUSTODY_ALLOWED_TARGET):
+      # selector branches/<preview branch>@<direct endpoint> of Neon project
+      # dawn-queen-54837741, database neondb, port 5432. The plan's staging block must
+      # report exactly these literals, and the child env below passes the selector
+      # through unchanged.
+      CMS_CUSTODY_ALLOWED_TARGET: branches/br-floral-sea-b7yrdbzv@ep-divine-pond-b798cm74.c-13.us-east-1.aws.neon.tech
+    steps:
+      # Same order as the org website-content-task job: bind the caller, the reusable
+      # workflow identity, the dispatched head and the task BEFORE any source is fetched
+      # or any credential is read. `job.workflow_ref` / `job.workflow_sha` are documented
+      # reusable-workflow context properties for the file that defines THIS job (GitHub
+      # contexts reference, job context; actionlint 1.7.12 does not know them — the
+      # finding stays visible and is not suppressed).
+      #
+      # The immutable head binding compares THREE values, none derived from another:
+      # the caller's RAW dispatch input (github.event.inputs.expected_head), the
+      # forwarded content_expected_head input, and this run's actual github.sha
+      # (GITHUB_SHA on the runner). All must be the same full lowercase 40-hex SHA.
+      # github.event.inputs exists only for the caller's workflow_dispatch; every other
+      # caller event has no content_task and never reaches this step.
+      - name: Bind the caller, the reusable-workflow identity, the head and the task
+        id: bind
+        working-directory: .
+        env:
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+          EVENT_REPOSITORY_ID: ${{ github.event.repository.id }}
+          EVENT_REPOSITORY_PRIVATE: ${{ github.event.repository.private }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          ACTOR_ID: ${{ github.actor_id }}
+          CONTENT_TASK: ${{ inputs.content_task }}
+          CONTENT_APPLY: ${{ inputs.content_apply }}
+          RAW_EXPECTED_HEAD: ${{ github.event.inputs.expected_head }}
+          CONTENT_EXPECTED_HEAD: ${{ inputs.content_expected_head }}
+          CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          WORKFLOW_REF: ${{ job.workflow_ref }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+          EXPECTED_HEAD: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # The raw-head binding comes first: a run whose dispatched head is not the
+          # head its dispatcher named stops here, before the checkout and before the
+          # OIDC/Infisical steps below.
+          printf '%s' "$RAW_EXPECTED_HEAD" | grep -Eq '^[0-9a-f]{40}$' || {
+            echo "::error::cms-login-custody requires the caller's raw expected_head dispatch input to be a full lowercase 40-hex SHA; no source is fetched and no credential is read"
+            exit 2
+          }
+          [ -n "$CONTENT_EXPECTED_HEAD" ] || {
+            echo "::error::cms-login-custody requires the forwarded content_expected_head input; no source is fetched and no credential is read"
+            exit 2
+          }
+          [ "$RAW_EXPECTED_HEAD" = "$EXPECTED_HEAD" ] || {
+            echo "::error::the caller's raw expected_head is not this run's github.sha; no source is fetched and no credential is read"
+            exit 2
+          }
+          [ "$CONTENT_EXPECTED_HEAD" = "$RAW_EXPECTED_HEAD" ] || {
+            echo "::error::the forwarded content_expected_head is not the caller's raw expected_head; no source is fetched and no credential is read"
+            exit 2
+          }
+          [ "$REPOSITORY" = "josephasmith1/precision-sd-nextjs" ]
+          [ "$REPOSITORY_ID" = "1072367530" ]
+          [ "$EVENT_REPOSITORY_ID" = "1072367530" ]
+          [ "$EVENT_REPOSITORY_PRIVATE" = "true" ]
+          [ "$ACTOR_ID" = "6611890" ]
+          [ "$WORKFLOW_REPOSITORY" = "1REALTOUR/vercel-prebuilt" ]
+          [ "$WORKFLOW_REF" = "1REALTOUR/vercel-prebuilt/.github/workflows/vercel-prebuilt.yml@refs/heads/main" ]
+          printf '%s' "$WORKFLOW_SHA" | grep -Eq '^[0-9a-f]{40}$'
+          printf '%s' "$EXPECTED_HEAD" | grep -Eq '^[0-9a-f]{40}$'
+          [ "$EXPECTED_HEAD" = "${GITHUB_SHA:-}" ]
+          [ "$CALLER_WORKFLOW_REF" = "josephasmith1/precision-sd-nextjs/.github/workflows/wordpress-content.yml@refs/heads/staging" ] || {
+            echo "::error::cms-login-custody must be dispatched by josephasmith1/precision-sd-nextjs/.github/workflows/wordpress-content.yml on refs/heads/staging"
+            exit 2
+          }
+          [ "$EVENT_NAME" = "workflow_dispatch" ]
+          [ "$REF" = "refs/heads/staging" ]
+          case "$CONTENT_TASK" in
+            cms-login-custody) ;;
+            *) echo "::error::content_task is not allowlisted"; exit 2 ;;
+          esac
+          case "$CONTENT_APPLY" in
+            true|false) ;;
+            *) echo "::error::content_apply is not a boolean input"; exit 2 ;;
+          esac
+          mkdir -p "$RUNNER_TEMP/cms-custody"
+          printf '%s' "$EXPECTED_HEAD" > "$RUNNER_TEMP/cms-custody/head"
+          echo "bound repository=$REPOSITORY id=$REPOSITORY_ID head=$EXPECTED_HEAD apply=$CONTENT_APPLY"
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.4.4"
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "24"
+
+      # A locked install that runs no lifecycle script ported from the org job (PMS 16445).
+      # It is NOT credential isolation for the caller's program: the custody CLI is
+      # executed below with `env -i` and an explicit variable allowlist, which is what
+      # keeps the Infisical token, the OIDC request token and the Actions token out of the
+      # child's environment.
+      - name: Install dependencies (locked), no lifecycle scripts
+        working-directory: .
+        env:
+          NPM_CONFIG_IGNORE_SCRIPTS: "true"
+        run: |
+          set -euo pipefail
+          if [ -f bun.lock ] || [ -f bun.lockb ]; then bun install --frozen-lockfile --ignore-scripts
+          elif [ -f package-lock.json ]; then
+            sha256sum package.json package-lock.json > "$RUNNER_TEMP/cms-custody/dependency-inputs.sha256"
+            bun install --no-save --ignore-scripts
+            sha256sum -c "$RUNNER_TEMP/cms-custody/dependency-inputs.sha256"
+          else echo "::error::the fixed custody caller requires a reviewed dependency lockfile"; exit 1; fi
+
+      # The FIXED staging binding. Project 5fef3c0e-4ff2-4dfb-8d51-4d0f346da22d is the
+      # precision-sd-nextjs Infisical project (deploy/coder/ubuntu-24.04/projects.json);
+      # environment staging is the preview/staging copy, never prod. Nothing here reads
+      # the handoff password: a plan run is credential-free apart from the database
+      # selector and PAYLOAD_SECRET, and the password is read only by the apply step,
+      # after the plan and its fresh target readback have succeeded. A 401/403/404 is a
+      # missing binding and fails closed with the exact binding named (never a value).
+      # Values are masked and written 0600 only; the OIDC JWT and the Infisical access
+      # token never leave this step's environment.
+      - name: Resolve the fixed staging binding from Infisical
+        working-directory: .
+        run: |
+          set -euo pipefail
+          umask 077
+          work="$RUNNER_TEMP/cms-custody"
+          JWT="$(curl -sf -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https://secrets.1realtour.icu" | jq -r .value)"
+          if [ -z "$JWT" ] || [ "$JWT" = "null" ]; then echo "OIDC token was not issued"; exit 1; fi
+          echo "::add-mask::$JWT"
+          ACCESS="$(jq -n --arg i "$INFISICAL_IDENTITY_ID" --arg j "$JWT" '{identityId:$i, jwt:$j}' \
+            | curl -sf -X POST https://secrets.1realtour.icu/api/v1/auth/oidc-auth/login \
+              -H 'Content-Type: application/json' --data-binary @- | jq -r '.accessToken // empty')"
+          JWT=""
+          if [ -z "$ACCESS" ]; then echo "Infisical OIDC login failed"; exit 1; fi
+          echo "::add-mask::$ACCESS"
+          status="$(curl -sS -o "$work/root.json" -w '%{http_code}' \
+            -H "Authorization: Bearer $ACCESS" \
+            "https://secrets.1realtour.icu/api/v3/secrets/raw?workspaceId=${CMS_CUSTODY_PROJECT_ID}&environment=staging&secretPath=/")"
+          ACCESS=""
+          if [ "$status" != "200" ]; then
+            rm -f "$work/root.json"
+            echo "::error::Infisical refused the fixed staging binding (HTTP ${status}) for identity ${INFISICAL_IDENTITY_ID} on project ${CMS_CUSTODY_PROJECT_ID} environment staging path /. If that is 403/404 the identity has no read grant on this project yet: add the membership through the documented Infisical path (bin/infisical-vercel-bootstrap memberships) — do not widen the shared identity or stage the value anywhere else."
+            exit 1
+          fi
+          for key in DATABASE_URL DATABASE_URL_UNPOOLED PAYLOAD_SECRET; do
+            VALUE="$(jq -r --arg k "$key" '(.secrets // [])[] | select(.secretKey == $k) | .secretValue // empty' "$work/root.json")"
+            if [ -z "$VALUE" ]; then
+              rm -f "$work/root.json"
+              echo "::error::${key} was not returned for project ${CMS_CUSTODY_PROJECT_ID} environment staging path /; refusing to continue without the fixed staging binding"
+              exit 1
+            fi
+            echo "::add-mask::$VALUE"
+            printf '%s' "$VALUE" > "$work/$key"
+            VALUE=""
+          done
+          rm -f "$work/root.json"
+
+      # The product owns the exact fixed-preview-DB refusal policy and the mode choice.
+      # `plan` is read-only: it prints exactly one non-sensitive JSON object whose
+      # `nextAction` names the one apply mode that is legal for the observed state
+      # (ensure-first-admin | create-team-user | rotate | manual-review). Nothing here
+      # reads the handoff password, and the child gets an `env -i` allowlist rather than
+      # this step's environment.
+      - name: Plan the CMS login custody change (writes nothing, reads no password)
+        id: plan
+        working-directory: .
+        env:
+          CONTENT_APPLY: ${{ inputs.content_apply }}
+          REPOSITORY: ${{ github.repository }}
+          EXPECTED_HEAD: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/cms-custody"
+          [ -f scripts/cms-custody.mjs ] || {
+            echo "::error::PENDING PRODUCT CONTRACT: scripts/cms-custody.mjs is not on this revision of refs/heads/staging, so the custody CLI this job runs does not exist yet. No handoff password was read and nothing was written."
+            exit 1
+          }
+          rc=0
+          env -i \
+            PATH="$PATH" \
+            HOME="$HOME" \
+            PAYLOAD_DATABASE_DIRECT=1 \
+            DATABASE_URL="$(cat "$work/DATABASE_URL")" \
+            DATABASE_URL_UNPOOLED="$(cat "$work/DATABASE_URL_UNPOOLED")" \
+            PAYLOAD_SECRET="$(cat "$work/PAYLOAD_SECRET")" \
+            CMS_CUSTODY_STAGING_BINDING=1 \
+            CMS_CUSTODY_ALLOWED_TARGET="$CMS_CUSTODY_ALLOWED_TARGET" \
+            CMS_CUSTODY_ENVIRONMENT=preview \
+            CMS_CUSTODY_RUNNER=j1v-precision-sd-nextjs \
+            GITHUB_REPOSITORY=josephasmith1/precision-sd-nextjs \
+            GITHUB_REPOSITORY_ID=1072367530 \
+            GITHUB_REF=refs/heads/staging \
+            node scripts/cms-custody.mjs plan --email "$CMS_CUSTODY_EMAIL" \
+              > "$work/plan.out" 2> "$work/plan.err" || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            code="$(sed -n 's/^\(error: [a-z][a-z0-9-]\{1,64\}\)$/\1/p' "$work/plan.err" | head -1)"
+            rm -f "$work/plan.err" "$work/plan.out"
+            [ -n "$code" ] || code="error: custody-operation-failed"
+            echo "::error::the read-only custody plan failed (exit ${rc}): ${code}. The target binding was refused or unavailable; no handoff password was read and nothing was written."
+            exit 1
+          fi
+          rm -f "$work/plan.err"
+          if [ "$(jq -s 'length' "$work/plan.out")" != "1" ] \
+            || ! jq -e 'type == "object"' "$work/plan.out" >/dev/null 2>&1; then
+            rm -f "$work/plan.out"
+            echo "::error::the custody plan did not print exactly one JSON object; refusing to choose an apply mode from an ambiguous plan. Nothing was written."
+            exit 1
+          fi
+          jq -e 'keys == ["admin","administratorPresent","mode","nextAction","readOnly","staging","target","users"]' \
+            "$work/plan.out" >/dev/null || {
+            rm -f "$work/plan.out"
+            echo "::error::the custody plan printed unexpected fields; refusing to read a plan this job does not understand. Nothing was written."
+            exit 1
+          }
+          # STRICT nested validation BEFORE any field is logged or published: exact
+          # nested keys and types, bounded ids and roles with no control characters,
+          # booleans where booleans belong, a nonnegative integer user count, and the
+          # exact fixed staging selector/project/branch/host/database/port. A plan
+          # that fails here has NO field echoed — not in an error, not in a log line,
+          # not in GITHUB_OUTPUT — because an unvalidated field is untrusted data.
+          jq -e --arg selector "$CMS_CUSTODY_ALLOWED_TARGET" '
+            (.mode == "plan") and (.readOnly == true) and
+            (.users | type == "number" and floor == . and . >= 0 and . <= 1000000000) and
+            (.administratorPresent | type == "boolean") and
+            (.nextAction == "ensure-first-admin" or .nextAction == "create-team-user"
+             or .nextAction == "rotate" or .nextAction == "manual-review") and
+            (.target | type == "object" and keys == ["collision","id","present","roles","unique"]
+              and (.present | type == "boolean") and (.unique | type == "boolean")
+              and (.collision | type == "boolean")
+              and (.id == null
+                   or (.id | type == "number" and floor == . and . >= 0 and . <= 1000000000000)
+                   or (.id | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")))
+              and (.roles | type == "array" and length <= 16 and length >= 0
+                   and all(.[]; type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")))) and
+            (.admin | type == "object" and keys == ["ambiguous","id","resolved","roles"]
+              and (.resolved | type == "boolean") and (.ambiguous | type == "boolean")
+              and (.id == null
+                   or (.id | type == "number" and floor == . and . >= 0 and . <= 1000000000000)
+                   or (.id | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")))
+              and (.roles | type == "array" and length <= 16
+                   and all(.[]; type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")))) and
+            (.staging | type == "object" and keys == ["bound","branch","database","host","port","project","selector"]
+              and .bound == true
+              and .selector == $selector
+              and .project == "dawn-queen-54837741"
+              and .branch == "br-floral-sea-b7yrdbzv"
+              and .host == "ep-divine-pond-b798cm74.c-13.us-east-1.aws.neon.tech"
+              and .database == "neondb"
+              and .port == 5432)
+          ' "$work/plan.out" >/dev/null || {
+            rm -f "$work/plan.out"
+            echo "::error::the custody plan failed strict validation of its nested fields (types, bounds, control characters, or the fixed staging binding); no field from it is logged or published. Nothing was written."
+            exit 1
+          }
+          # Only validated values are read out, and only now.
+          next_action="$(jq -r .nextAction "$work/plan.out")"
+          users_count="$(jq -r .users "$work/plan.out")"
+          target_id="$(jq -r '.target.id // empty' "$work/plan.out")"
+          target_roles="$(jq -r '(.target.roles // []) | join(",")' "$work/plan.out")"
+          admin_present="$(jq -r .administratorPresent "$work/plan.out")"
+          staging_branch="$(jq -r .staging.branch "$work/plan.out")"
+          plan_mode="$(jq -r .mode "$work/plan.out")"
+          plan_read_only="$(jq -r .readOnly "$work/plan.out")"
+          plan_bound="$(jq -r .staging.bound "$work/plan.out")"
+          echo "plan nextAction=$next_action users=$users_count target_id=${target_id:-none} target_roles=${target_roles:-none} administrator_present=$admin_present staging_branch=$staging_branch"
+          # The single bounded plan record the rotate preflight verifies in this job's
+          # log: it names the bound head, the fixed repository and staging selector,
+          # apply=false for a plan dispatch, and the validated plan facts. One line,
+          # emitted once, only after the strict validation above.
+          echo "cms-custody plan-record head=$EXPECTED_HEAD repo=$REPOSITORY selector=$CMS_CUSTODY_ALLOWED_TARGET apply=$CONTENT_APPLY mode=$plan_mode read_only=$plan_read_only bound=$plan_bound next_action=$next_action"
+          {
+            echo "next_action=$next_action"
+            echo "target_id=$target_id"
+            echo "target_roles=$target_roles"
+          } >> "$GITHUB_OUTPUT"
+          rm -f "$work/plan.out"
+
+      # Only apply reads the staged handoff password, and only after the plan above has
+      # succeeded on this exact commit. `manual-review` is a refusal, never a write: the
+      # plan says the observed state (no or ambiguous administrator, a target collision,
+      # or a target that carries admin) needs a human decision, so the password is not
+      # even read.
+      - name: Read the staged handoff password from the fixed Infisical folder (apply only)
+        if: inputs.content_apply
+        working-directory: .
+        env:
+          NEXT_ACTION: ${{ steps.plan.outputs.next_action }}
+        run: |
+          set -euo pipefail
+          umask 077
+          work="$RUNNER_TEMP/cms-custody"
+          case "$NEXT_ACTION" in
+            ensure-first-admin|create-team-user|rotate) ;;
+            manual-review)
+              echo "::error::the read-only plan returned nextAction=manual-review (no or ambiguous administrator principal, a duplicate target, or a target that carries admin). The product module refuses to turn manual-review into a write; no handoff password was read and nothing was written."
+              exit 1
+              ;;
+            *)
+              echo "::error::the plan did not select an apply mode; no handoff password was read and nothing was written."
+              exit 1
+              ;;
+          esac
+          JWT="$(curl -sf -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https://secrets.1realtour.icu" | jq -r .value)"
+          if [ -z "$JWT" ] || [ "$JWT" = "null" ]; then echo "OIDC token was not issued"; exit 1; fi
+          echo "::add-mask::$JWT"
+          ACCESS="$(jq -n --arg i "$INFISICAL_IDENTITY_ID" --arg j "$JWT" '{identityId:$i, jwt:$j}' \
+            | curl -sf -X POST https://secrets.1realtour.icu/api/v1/auth/oidc-auth/login \
+              -H 'Content-Type: application/json' --data-binary @- | jq -r '.accessToken // empty')"
+          JWT=""
+          if [ -z "$ACCESS" ]; then echo "Infisical OIDC login failed"; exit 1; fi
+          echo "::add-mask::$ACCESS"
+          status="$(curl -sS -o "$work/users.json" -w '%{http_code}' \
+            -H "Authorization: Bearer $ACCESS" \
+            "https://secrets.1realtour.icu/api/v3/secrets/raw?workspaceId=${CMS_CUSTODY_PROJECT_ID}&environment=staging&secretPath=/cms-users")"
+          ACCESS=""
+          if [ "$status" != "200" ]; then
+            rm -f "$work/users.json"
+            echo "::error::Infisical refused the fixed handoff folder (HTTP ${status}) for identity ${INFISICAL_IDENTITY_ID} on project ${CMS_CUSTODY_PROJECT_ID} environment staging path /cms-users. A 403/404 means the identity cannot read the folder or the staged key is absent: stage it with bin/vault-login (never by hand) and retry; nothing was applied."
+            exit 1
+          fi
+          VALUE="$(jq -r '(.secrets // [])[] | select(.secretKey == "CMS_TEAM_LOGIN_PASSWORD") | .secretValue // empty' "$work/users.json")"
+          rm -f "$work/users.json"
+          if [ -z "$VALUE" ]; then
+            echo "::error::CMS_TEAM_LOGIN_PASSWORD was not returned from project ${CMS_CUSTODY_PROJECT_ID} environment staging path /cms-users; nothing was applied"
+            exit 1
+          fi
+          echo "::add-mask::$VALUE"
+          printf '%s' "$VALUE" > "$work/CMS_TEAM_LOGIN_PASSWORD"
+          VALUE=""
+
+      # One CLI invocation, one documented mode, the IDs and roles the plan just read.
+      # The password reaches the product only on file descriptor 3 (never argv, never the
+      # environment). The child runs under `env -i`, so the Infisical token, the OIDC
+      # request token, the Actions token and every other credential this job holds are
+      # absent from its environment. Its stdout/stderr are captured privately and only
+      # validated, non-sensitive fields are printed; a raw driver or credential error is
+      # never echoed.
+      - name: Apply the CMS login custody change
+        if: inputs.content_apply
+        working-directory: .
+        env:
+          NEXT_ACTION: ${{ steps.plan.outputs.next_action }}
+          TARGET_ID: ${{ steps.plan.outputs.target_id }}
+          TARGET_ROLES: ${{ steps.plan.outputs.target_roles }}
+        run: |
+          set -euo pipefail
+          umask 077
+          work="$RUNNER_TEMP/cms-custody"
+          [ -f "$work/CMS_TEAM_LOGIN_PASSWORD" ] || {
+            echo "::error::the staged handoff password was not resolved; refusing to apply"; exit 1;
+          }
+          case "$NEXT_ACTION" in
+            ensure-first-admin|create-team-user) args=( "$NEXT_ACTION" --apply --email "$CMS_CUSTODY_EMAIL" ) ;;
+            rotate)
+              [ -n "$TARGET_ID" ] && [ -n "$TARGET_ROLES" ] || {
+                echo "::error::the plan selected rotate without a target id or roles; refusing to guess the rotation contract"; exit 1;
+              }
+              args=( rotate --apply --email "$CMS_CUSTODY_EMAIL" --target-id "$TARGET_ID" --expect-roles "$TARGET_ROLES" )
+              ;;
+            *)
+              echo "::error::no apply mode was selected by the plan; nothing was written"; exit 1 ;;
+          esac
+          rc=0
+          env -i \
+            PATH="$PATH" \
+            HOME="$HOME" \
+            PAYLOAD_DATABASE_DIRECT=1 \
+            DATABASE_URL="$(cat "$work/DATABASE_URL")" \
+            DATABASE_URL_UNPOOLED="$(cat "$work/DATABASE_URL_UNPOOLED")" \
+            PAYLOAD_SECRET="$(cat "$work/PAYLOAD_SECRET")" \
+            CMS_CUSTODY_STAGING_BINDING=1 \
+            CMS_CUSTODY_ALLOWED_TARGET="$CMS_CUSTODY_ALLOWED_TARGET" \
+            CMS_CUSTODY_ENVIRONMENT=preview \
+            CMS_CUSTODY_RUNNER=j1v-precision-sd-nextjs \
+            GITHUB_REPOSITORY=josephasmith1/precision-sd-nextjs \
+            GITHUB_REPOSITORY_ID=1072367530 \
+            GITHUB_REF=refs/heads/staging \
+            node scripts/cms-custody.mjs "${args[@]}" --password-fd 3 3< "$work/CMS_TEAM_LOGIN_PASSWORD" \
+              > "$work/apply.out" 2> "$work/apply.err" || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            code="$(sed -n 's/^\(error: [a-z][a-z0-9-]\{1,64\}\)$/\1/p' "$work/apply.err" | head -1)"
+            rm -f "$work/apply.err" "$work/apply.out" "$work/CMS_TEAM_LOGIN_PASSWORD"
+            [ -n "$code" ] || code="error: custody-operation-failed"
+            echo "::error::the custody apply exited ${rc}: ${code}. The durable outcome is UNVERIFIED and POSSIBLY WRITTEN — the product can refuse with exit 1 AFTER the commit, during persisted-row/session/identity/login verification, so a nonzero exit is never evidence that nothing was written. Re-run the read-only plan before any retry. The handoff copy is left in place for the operator."
+            exit 1
+          fi
+          rm -f "$work/apply.err"
+          if [ "$(jq -s 'length' "$work/apply.out")" != "1" ] \
+            || ! jq -e --arg m "$NEXT_ACTION" '.mode == $m and .writes == 1' "$work/apply.out" >/dev/null 2>&1; then
+            rm -f "$work/apply.out"
+            echo "::error::the custody apply did not print exactly one success record for the mode the plan selected; treating the outcome as undetermined and possibly written. Re-run the read-only plan before any retry."
+            exit 1
+          fi
+          # The same strict safe-value rule as the plan: the ids and booleans printed
+          # below are validated (type, bounds, no control characters) BEFORE anything
+          # is echoed. An untrusted field never reaches a log line.
+          if [ "$NEXT_ACTION" = "rotate" ]; then
+            jq -e '(.verified | type == "string"
+                    and test("^verified: persisted credential readback and login for user [A-Za-z0-9][A-Za-z0-9._:-]{0,63}$"))
+                  and (.rotated | type == "object"
+                    and (.id == null
+                         or (.id | type == "number" and floor == . and . >= 0 and . <= 1000000000000)
+                         or (.id | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$"))))
+                  and (.sessionsEnded | type == "boolean")' \
+              "$work/apply.out" >/dev/null || {
+              rm -f "$work/apply.out"
+              echo "::error::the rotation record failed validation of its verification line or ids; treating the outcome as undetermined and possibly written. No field from the record is printed."
+              exit 1
+            }
+            echo "applied mode=rotate user_id=$(jq -r '.rotated.id' "$work/apply.out") writes=1 sessions_ended=$(jq -r .sessionsEnded "$work/apply.out")"
+          else
+            jq -e --arg e "$CMS_CUSTODY_EMAIL" '.created | type == "object" and .email == $e
+                  and (.id == null
+                       or (.id | type == "number" and floor == . and . >= 0 and . <= 1000000000000)
+                       or (.id | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")))' \
+              "$work/apply.out" >/dev/null || {
+              rm -f "$work/apply.out"
+              echo "::error::the custody record does not show a validated designated-address creation; treating the outcome as undetermined and possibly written. No field from the record is printed."
+              exit 1
+            }
+            echo "applied mode=$NEXT_ACTION user_id=$(jq -r '.created.id' "$work/apply.out") writes=1"
+          fi
+          rm -f "$work/apply.out"
+
+      # Native end-to-end login check against the fixed VERIFIED preview origin, with the
+      # password on a 0600 file that never reaches argv and a response that is parsed and
+      # deleted without ever being printed (no JWT, no credential, no error text). The
+      # printed line is the app registry's verify_pattern.
+      - name: Verify the new login through the preview origin
+        if: inputs.content_apply
+        working-directory: .
+        env:
+          TARGET_ID: ${{ steps.plan.outputs.target_id }}
+        run: |
+          set -euo pipefail
+          umask 077
+          work="$RUNNER_TEMP/cms-custody"
+          [ -f "$work/CMS_TEAM_LOGIN_PASSWORD" ] || {
+            echo "::error::the staged handoff password is no longer available; the write was made but the login cannot be verified"; exit 1;
+          }
+          if [ -z "$CMS_CUSTODY_VERIFY_ORIGIN" ]; then
+            echo "::error::no verified preview origin is bound; the login cannot be verified end to end"
+            exit 1
+          fi
+          jq -n --arg email "$CMS_CUSTODY_EMAIL" --rawfile password "$work/CMS_TEAM_LOGIN_PASSWORD" \
+            '{email:$email,password:$password}' > "$work/login-request.json"
+          status="$(curl -sS -o "$work/login-response.json" -w '%{http_code}' \
+            -X POST -H 'Content-Type: application/json' \
+            --data-binary "@$work/login-request.json" \
+            "$CMS_CUSTODY_VERIFY_ORIGIN/api/users/login")" || status="000"
+          rm -f "$work/login-request.json"
+          if [ "$status" != "200" ]; then
+            rm -f "$work/login-response.json"
+            echo "::error::the preview origin refused the new credential (HTTP ${status}); the product module reported the custody write, so this is a deployed-app mismatch that needs review before the handoff copy is cleared."
+            exit 1
+          fi
+          user_id="$(jq -r '.user.id // empty' "$work/login-response.json" 2>/dev/null || true)"
+          token_present="$(jq -r 'if (.token // "") == "" then "no" else "yes" end' "$work/login-response.json" 2>/dev/null || echo no)"
+          rm -f "$work/login-response.json"
+          [ -n "$user_id" ] && [ "$token_present" = "yes" ] || {
+            echo "::error::the preview origin answered without a user session; the login was not verified"
+            exit 1
+          }
+          # The id is validated BEFORE it can be compared or echoed: a bounded safe
+          # scalar only, so an unexpected response body can never put untrusted bytes
+          # into a shared log line.
+          printf '%s' "$user_id" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$' || {
+            echo "::error::the preview origin answered with a user id that failed validation; the login was not verified and the id is not printed"
+            exit 1
+          }
+          if [ -n "$TARGET_ID" ] && [ "$user_id" != "$TARGET_ID" ]; then
+            echo "::error::the preview origin authenticated a different user than the plan's target; refusing to report the rotation as verified"
+            exit 1
+          fi
+          echo "cms-custody verified: login works for user ${user_id}"
+
+      - name: Remove credentials and the workspace
+        if: always()
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/cms-custody" || true
+          rm -f "$RUNNER_TEMP"/cms-custody* || true
+          rm -f ~/.npmrc ~/.pnpmrc || true
+          cd "$GITHUB_WORKSPACE" && rm -rf ./* ./.??* || true
+
   deploy:
     # Refuse BEFORE a runner is requested (2026-10-06): the checks below used to run only as the
     # first step, i.e. after a self-hosted build runner had accepted the job. A disallowed caller
@@ -152,8 +760,20 @@ jobs:
             fi
           fi
 
+      # The capture flag is a Fleet-side consumer switch, not a caller-selected identity: only the
+      # one fixed private repository, on a push to protected main, in the production environment may
+      # turn it on. This runs before the source is fetched and before any credential is read, so a
+      # widened or mistaken caller cannot even obtain the Vercel token with the flag set.
+      - name: Refuse source_map_capture outside the one fixed production caller
+        if: ${{ inputs.source_map_capture && !(github.repository == 'josephasmith1/dermalactives-mx' && github.repository_id == 1286557000 && github.event.repository.id == 1286557000 && github.event.repository.private == true && github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.environment == 'production') }}
+        working-directory: .
+        run: |
+          set -euo pipefail
+          echo "::error::source_map_capture is accepted only from josephasmith1/dermalactives-mx (id 1286557000) on a push to refs/heads/main in the production environment; this run is ${GITHUB_REPOSITORY} (id ${GITHUB_REPOSITORY_ID}) event ${GITHUB_EVENT_NAME} ref ${GITHUB_REF} environment '${{ inputs.environment }}'."
+          exit 1
+
       - if: ${{ !inputs.source_archive }}
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: ${{ github.repository }}
           ref: ${{ github.sha }}
@@ -187,7 +807,31 @@ jobs:
           done
           exit 1
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+      # Provenance for the revision that actually executes. `job.workflow_sha` is a documented
+      # reusable-workflow context property (GitHub contexts reference: "the commit SHA of the
+      # workflow file that contains the job"); the caller stays on `@main` because the Infisical
+      # identity is bound to refs/heads/main — a SHA pin would change job_workflow_ref and the
+      # OIDC login would be refused. The revision is recorded for every run and REQUIRED for the
+      # private capture path, whose release proof names the executed workflow revision.
+      # (actionlint 1.7.12 does not know job.workflow_sha — rhysd/actionlint#707 is unmerged;
+      # the finding is left unsuppressed and is not claimed as a pass.)
+      - name: Record the reusable workflow revision
+        env:
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+          CAPTURE: ${{ inputs.source_map_capture && '1' || '0' }}
+        run: |
+          set -euo pipefail
+          if printf '%s' "$WORKFLOW_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "PREBUILT_WORKFLOW_SHA=$WORKFLOW_SHA" >> "$GITHUB_ENV"
+            echo "reusable workflow revision: $WORKFLOW_SHA" >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$CAPTURE" = "1" ]; then
+            echo "::error::job.workflow_sha is not a 40-hex commit id ('${WORKFLOW_SHA:-<empty>}'); the source-map release proof requires the executed workflow revision"
+            exit 1
+          else
+            echo "::warning::job.workflow_sha is not a 40-hex commit id ('${WORKFLOW_SHA:-<empty>}'); this run is not recorded with its workflow revision"
+          fi
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: ${{ inputs.node_version || '24' }}
 
@@ -195,7 +839,8 @@ jobs:
         run: |
           set -euo pipefail
           corepack enable
-          npm install -g vercel@59.25.4
+          # --ignore-scripts: the shared identity rule in the header; the CLI needs no lifecycle hook.
+          npm install -g vercel@59.25.4 --ignore-scripts
           vercel --version
 
       - name: Detect Bun
@@ -209,27 +854,121 @@ jobs:
           else echo "need=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # The action resolves the version from its `bun-version` input, then the
+      # `bun-version-file` input, then the CALLER's root package.json (`packageManager`,
+      # else `engines.bun`) — never a nested manifest — and otherwise installs the latest
+      # release tag at run time. This workflow deliberately does not override that pin
+      # (dermalactives-mx pins bun@1.3.11 and runs the explicit-flag branch); the version
+      # is exposed to the install step so the custom-command guard can be version-bound.
       - name: Install Bun
+        id: bun_install
         if: steps.bun.outputs.need == 'true'
-        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
 
-      - name: Install dependencies
+      # Every install in this workflow runs WITHOUT dependency lifecycle scripts (the
+      # shared-identity rule in the header). This job later holds the team-wide Vercel API
+      # token, and the identity is bound to this workflow file, so a package postinstall is
+      # exactly the code that must never run here. NPM_CONFIG_IGNORE_SCRIPTS covers the
+      # caller's own install command as well: npm and Bun document that variable
+      # (Bun: bun.com/docs/pm/cli/install "Lifecycle Script Management"), so a manager
+      # install inside the command skips lifecycle scripts while an explicit step the caller
+      # writes (for example `prisma generate`) still runs.
+      #
+      # NPM_CONFIG_IGNORE_SCRIPTS is documented by Bun only from 1.4.4 and was measured to be
+      # a no-op in 1.3.11 (bun-v1.4.4 docs, "Lifecycle Script Management": "Also set by
+      # NPM_CONFIG_IGNORE_SCRIPTS=true in the environment"). `--ignore-scripts` itself works
+      # on every version, but the command is the caller's and is never rewritten here. So a
+      # custom command that invokes Bun is gated twice, inside the SAME login shell that runs
+      # it (a login shell rebuilds PATH from /etc/profile and the user profile, so a version
+      # read anywhere else would not prove which `bun` the command resolves):
+      #   1. the version the pinned setup action reports (`bun-version`, the `bun --version`
+      #      output of the binary it installed) must be a strict stable X.Y.Z at or above
+      #      1.4.4 — empty, malformed, prerelease/canary and build-suffixed values are
+      #      refused, never trimmed into a passing value;
+      #   2. the `bun` resolved on PATH there must be the executable the action installed
+      #      (`bun-path`, same file) and must report exactly that stable version.
+      # Either mismatch refuses the run before the caller's command starts. The command's
+      # text is neither parsed nor rewritten: it is the last line of that shell.
+      - name: Install dependencies (no lifecycle scripts)
         env:
           INSTALL_COMMAND: ${{ inputs.install_command }}
+          NPM_CONFIG_IGNORE_SCRIPTS: "true"
+          BUN_VERSION: ${{ steps.bun_install.outputs.bun-version }}
+          BUN_PATH: ${{ steps.bun_install.outputs.bun-path }}
         run: |
           set -euo pipefail
           if [ -n "$INSTALL_COMMAND" ]; then
-            bash -lc "$INSTALL_COMMAND"
+            if printf '%s' "$INSTALL_COMMAND" | grep -q bun; then
+              # The guard is prepended to the caller's command text inside the one login
+              # shell that executes it, so the `bun` it resolves is the binary the command
+              # then runs. `( ... ) || exit 1` keeps this state and its explicit exits out
+              # of the caller's script, and adds no errexit, so the command's own semantics
+              # are unchanged. No value is interpolated into the messages: a caller-supplied
+              # command or an unparsable version is never echoed.
+              BUN_GUARD="$(cat <<'BUN_GUARD_EOF'
+              (
+                bun_floor=1.4.4
+                bun_stable() {
+                  printf "%s" "$1" | grep -Eq "^(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*)){2}$"
+                }
+                bun_ge() {
+                  local IFS=. a b i
+                  a=($1)
+                  b=($2)
+                  for i in 0 1 2; do
+                    if [ "$((10#${a[i]}))" -gt "$((10#${b[i]}))" ]; then return 0; fi
+                    if [ "$((10#${a[i]}))" -lt "$((10#${b[i]}))" ]; then return 1; fi
+                  done
+                  return 0
+                }
+                want="${BUN_VERSION:-}"
+                want_path="${BUN_PATH:-}"
+                if [ -z "$want" ] || ! bun_stable "$want"; then
+                  echo "::error::the setup action did not resolve a stable Bun version (X.Y.Z, no prerelease, canary or build suffix) for this run, so NPM_CONFIG_IGNORE_SCRIPTS cannot be relied on for a custom Bun install command; refusing to install. Pin a stable Bun at 1.4.4 or later in the repository root package.json (packageManager or engines.bun), or add --ignore-scripts to the install command."
+                  exit 1
+                fi
+                bin="$(command -v bun 2>/dev/null || true)"
+                if [ -z "$bin" ]; then
+                  echo "::error::the login shell that runs the install command resolves no bun executable, so the Bun that the setup action installed cannot be proved to be the one it runs; refusing to install. Add --ignore-scripts to the install command or use the workflow lockfile install."
+                  exit 1
+                fi
+                if [ -n "$want_path" ]; then
+                  if [ ! -e "$want_path" ] || [ ! -e "$bin" ] || [ ! "$bin" -ef "$want_path" ]; then
+                    echo "::error::the bun resolved in the login shell is not the executable the setup action installed, so the version this guard proved is not the version the install command would run; refusing to install. Remove the earlier bun from the runner image or login profile, or add --ignore-scripts to the install command."
+                    exit 1
+                  fi
+                fi
+                have="$("$bin" --version 2>/dev/null || true)"
+                if [ -z "$have" ] || ! bun_stable "$have"; then
+                  echo "::error::the bun resolved in the login shell did not report a stable version (X.Y.Z, no prerelease, canary or build suffix); refusing to install, because NPM_CONFIG_IGNORE_SCRIPTS is documented only for stable Bun 1.4.4 and later."
+                  exit 1
+                fi
+                if ! bun_ge "$have" "$bun_floor"; then
+                  echo "::error::the bun resolved in the login shell is below 1.4.4, where NPM_CONFIG_IGNORE_SCRIPTS is documented to do nothing and install-time lifecycle scripts would run; refusing to install. Pin a stable Bun at 1.4.4 or later in the repository root package.json (packageManager or engines.bun), or add --ignore-scripts to the install command."
+                  exit 1
+                fi
+                if [ "$have" != "$want" ]; then
+                  echo "::error::the bun version resolved in the login shell differs from the version the setup action installed; refusing to install with a Bun that was not the one proved. Remove the earlier bun from the runner image or login profile, or add --ignore-scripts to the install command."
+                  exit 1
+                fi
+              ) || exit 1
+          BUN_GUARD_EOF
+              )"
+              bash -lc "$BUN_GUARD
+          $INSTALL_COMMAND"
+            else
+              bash -lc "$INSTALL_COMMAND"
+            fi
           elif [ -f pnpm-lock.yaml ]; then
             PM="$(node -p "require('./package.json').packageManager || ''")"
             if [ -n "$PM" ]; then corepack prepare "$PM" --activate
             else corepack prepare pnpm@10.34.5 --activate
             fi
-            pnpm install --frozen-lockfile
-          elif [ -f bun.lock ] || [ -f bun.lockb ]; then bun install --frozen-lockfile
-          elif [ -f package-lock.json ]; then npm ci
-          elif [ -f yarn.lock ]; then corepack prepare yarn@1.22.22 --activate && yarn install --frozen-lockfile
-          elif [ -f package.json ]; then npm install
+            pnpm install --frozen-lockfile --ignore-scripts
+          elif [ -f bun.lock ] || [ -f bun.lockb ]; then bun install --frozen-lockfile --ignore-scripts
+          elif [ -f package-lock.json ]; then npm ci --ignore-scripts
+          elif [ -f yarn.lock ]; then corepack prepare yarn@1.22.22 --activate && yarn install --frozen-lockfile --ignore-scripts
+          elif [ -f package.json ]; then npm install --ignore-scripts
           else echo "static project: no package.json to install"
           fi
 
@@ -258,12 +997,16 @@ jobs:
           ( umask 077; printf '%s' "$ACCESS" > "$RUNNER_TEMP/infisical-prebuilt.token" )
           echo "INFISICAL_ACCESS_FILE=$RUNNER_TEMP/infisical-prebuilt.token" >> "$GITHUB_ENV"
 
-      - name: Build and deploy the prebuilt output
+      - name: Build the prebuilt output
         env:
           VERCEL_ORG_ID: ${{ inputs.vercel_org_id }}
           VERCEL_PROJECT_ID: ${{ inputs.vercel_project_id }}
           VERCEL: "1"
           VERCEL_ENV: ${{ inputs.environment }}
+          # 'true' ONLY for the one fixed private caller on a push to protected main in the
+          # production environment, and only when the caller asked for it. The product compares
+          # the literal string; every other run receives 'false' and is a complete no-op.
+          SOURCE_MAP_CAPTURE: ${{ (inputs.source_map_capture && github.repository == 'josephasmith1/dermalactives-mx' && github.repository_id == 1286557000 && github.event.repository.id == 1286557000 && github.event.repository.private == true && github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.environment == 'production') && 'true' || 'false' }}
           VERCEL_GIT_PROVIDER: github
           VERCEL_GIT_COMMIT_SHA: ${{ github.sha }}
           VERCEL_GIT_COMMIT_REF: ${{ github.ref_name }}
@@ -284,78 +1027,6 @@ jobs:
             exit 1
           fi
           if [ "$paused" = "unknown" ]; then echo "::warning::could not read the Vercel project's paused state; continuing"; fi
-          # Deployment Vercel already created for this commit since this step started:
-          # "<state> https://<url>", "" when there is none, or "UNKNOWN lookup-failed" when the API call fails.
-          deploy_started_ms="$(( $(date +%s) * 1000 ))"
-          existing_deployment() {
-            local target_q=""
-            if [ "$VERCEL_ENV" = "production" ]; then target_q="&target=production"; fi
-            curl -fsS --max-time 20 -H "Authorization: Bearer $VERCEL_TOKEN" \
-              "https://api.vercel.com/v6/deployments?projectId=${VERCEL_PROJECT_ID}&teamId=${VERCEL_ORG_ID}&sha=${VERCEL_GIT_COMMIT_SHA}&since=${deploy_started_ms}&limit=5${target_q}" \
-              | jq -r '[.deployments[] | select(.meta.githubCommitSha == env.VERCEL_GIT_COMMIT_SHA)]
-                       | sort_by(.created) | last
-                       | if . == null then "" else "\(.state // .readyState) https://\(.url)" end' \
-              || echo "UNKNOWN lookup-failed"
-          }
-          deploy_prebuilt() {
-            local attempt found state url poll
-            for attempt in 1 2 3; do
-              # Each attempt is bounded: the CLI waits for the deployment to be ready and never
-              # gives up on its own (2026-10-04: two previews held a runner 44 min each).
-              if [ "$VERCEL_ENV" = "production" ]; then
-                timeout --kill-after=30 600 vercel deploy --prebuilt --prod --archive=tgz > "$RUNNER_TEMP/deploy-url.txt" && return 0
-              else
-                timeout --kill-after=30 600 vercel deploy --prebuilt --archive=tgz > "$RUNNER_TEMP/deploy-url.txt" && return 0
-              fi
-              echo "prebuilt deploy attempt ${attempt} failed"
-              # The CLI can fail AFTER Vercel has created (and, with --prod, promoted) the
-              # deployment: 2026-10-06 dermalactives-ecommerce run 37550444323 uploaded 632MB,
-              # printed "Error: fetch failed" on all 3 attempts, and failed the job while
-              # dpl_ApvsjMgDPWh37rNXvPCWzNKLqAWa was READY in production. Adopt that deployment
-              # instead of failing or uploading a duplicate; wait while it is still building.
-              # Once Vercel has created a deployment for this commit, never upload again: the build
-              # carries NEXT_DEPLOYMENT_ID, and Vercel rejects a second deployment with the same ID
-              # ("A deployment with the user-configured deploymentId ... already exists").
-              # 2026-11-05 dermalactives-ecommerce run 42078474067: the deployment sat QUEUED past
-              # the old 8-minute wait, both re-uploads were refused, and the job failed while the
-              # deployment later went READY. So wait for the one that exists (up to 20 minutes).
-              for poll in $(seq 1 60); do
-                # Stop waiting with our own error before the 60-minute job limit kills the step.
-                if [ $(( $(date +%s) - deploy_started_ms / 1000 )) -gt 2700 ]; then
-                  echo "::error::the deployment for this commit was still ${state:-unknown} after 45 minutes in this step."
-                  return 1
-                fi
-                found="$(existing_deployment)"
-                state="${found%% *}"
-                url="${found#* }"
-                case "$state" in
-                  READY)
-                    echo "$url" > "$RUNNER_TEMP/deploy-url.txt"
-                    echo "::warning::vercel deploy reported a failure, but Vercel created $url for this commit and it is READY; using it."
-                    return 0
-                    ;;
-                  BUILDING | INITIALIZING | QUEUED | UNKNOWN)
-                    echo "deployment for this commit is $state; waiting (${poll}/60)"
-                    sleep 20
-                    ;;
-                  "")
-                    # No deployment was created, so a new upload can use the ID.
-                    break
-                    ;;
-                  *)
-                    echo "::error::Vercel created $url for this commit and it ended $state. A new upload would reuse its deployment ID and be refused."
-                    return 1
-                    ;;
-                esac
-              done
-              if [ -n "$state" ]; then
-                echo "::error::the deployment for this commit was still $state after 20 minutes of waiting."
-                return 1
-              fi
-              sleep 20
-            done
-            return 1
-          }
           # Build values come from Infisical, the source of truth (decision 2026-09-23). Vercel
           # never returns `sensitive` values; `vercel pull` writes "[SENSITIVE]" for them unless
           # the env file already holds a local value, which it keeps ("Kept N existing local
@@ -477,10 +1148,209 @@ jobs:
           else
             vercel build
           fi
+
+      # ---- source-map capture boundary -------------------------------------------------------
+      # Everything above BUILDS; everything below DEPLOYS. The capture steps sit between them so a
+      # missing, unsafe or oversized map set fails the run BEFORE a production deployment exists
+      # (contract mx-private-source-map-artifact: build/capture/strip -> absence checks -> private
+      # artifact upload -> deploy). A caller that does not set source_map_capture sees these
+      # steps skipped and an unchanged deployment.
+      - name: Fail closed unless maps and pointers left the deploy output
+        if: ${{ inputs.source_map_capture && github.repository == 'josephasmith1/dermalactives-mx' && github.repository_id == 1286557000 && github.event.repository.id == 1286557000 && github.event.repository.private == true && github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.environment == 'production' }}
+        working-directory: .
+        env:
+          ROOT_DIR: ${{ inputs.root_directory }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, sys
+          from pathlib import Path
+
+          root = Path(os.environ["ROOT_DIR"]).resolve()
+          staging = Path(os.environ["RUNNER_TEMP"]) / "source-maps" / "dermalactives-mx" / (
+              f"run-{os.environ['RUN_ID']}-attempt-{os.environ['RUN_ATTEMPT']}")
+
+          def fail(message):
+              print(f"::error::{message}")
+              raise SystemExit(1)
+
+          # The staging root and every component between RUNNER_TEMP and it are
+          # classified before is_dir() follows anything: a linked root/parent
+          # would otherwise let the whole captured tree live somewhere else while
+          # this step reported on an empty directory.
+          temp_root = Path(os.environ["RUNNER_TEMP"])
+          if temp_root not in staging.parents:
+              fail("the source-map staging directory escapes RUNNER_TEMP")
+          for part in (staging, *staging.parents):
+              if part == temp_root:
+                  break
+              if part.is_symlink():
+                  fail("the source-map staging path contains a symlink")
+          if not staging.is_dir():
+              fail(f"the source-map staging directory {staging.name} does not exist; the product capture did not run")
+          symlinks = [p for p in staging.rglob("*") if p.is_symlink()]
+          if symlinks:
+              fail("the source-map staging directory contains a symlink")
+          files = sorted(p.relative_to(staging).as_posix() for p in staging.rglob("*") if p.is_file())
+          if "maps.manifest.json" not in files:
+              fail("the source-map staging directory has no maps.manifest.json")
+          if any(name.startswith(".") or "/." in name for name in files):
+              fail("the source-map staging directory contains a hidden file")
+          for name in files:
+              if name == "maps.manifest.json":
+                  continue
+              if not (name.startswith("maps/") and name.endswith(".map")):
+                  fail("the source-map staging directory contains a file outside the contract layout")
+          if len(files) < 2:
+              fail("the source-map staging directory carries no maps")
+          try:
+              manifest = json.loads((staging / "maps.manifest.json").read_text(encoding="utf-8"))
+          except (OSError, ValueError):
+              fail("the staged maps.manifest.json is not UTF-8 JSON")
+          if not isinstance(manifest, dict) or manifest.get("mapCount") != len(files) - 1:
+              fail("the staged manifest mapCount does not match the staged map files")
+
+          targets = [root / ".next", root / ".vercel" / "output"]
+          for base in targets:
+              # rglob never descends a linked directory (Python 3.12), so a
+              # linked subtree would be skipped while this step still reported
+              # the tree map-free. Every entry is classified first: a linked
+              # directory refuses, a linked file is still read (never waived),
+              # and an ordinary directory is traversed as before.
+              if base.is_symlink():
+                  fail(f"the deploy output {base.name} is a symbolic link")
+              if not base.is_dir():
+                  continue
+              for path in base.rglob("*"):
+                  if path.is_symlink():
+                      if path.is_dir():
+                          fail(f"the deploy output under {base.name} contains a linked directory")
+                      if not path.is_file():
+                          fail(f"the deploy output under {base.name} contains a broken symbolic link")
+                  elif path.is_dir():
+                      continue
+                  elif not path.is_file():
+                      fail(f"the deploy output under {base.name} contains a non-regular entry")
+                  if path.suffix == ".map":
+                      fail(f"a source map survived in the deploy output under {base.name}")
+                  if path.suffix != ".js":
+                      continue
+                  # Fail closed on a bundle too large for this step to read: the old
+                  # `continue` silently exempted every served .js above 50 MiB, so an
+                  # inline sourceMappingURL=data:... in such a bundle shipped unchecked
+                  # while this step reported that no pointers remained.
+                  if path.stat().st_size > 50 * 1024 * 1024:
+                      fail(f"a served bundle under {base.name} is larger than 50 MiB, so a sourceMappingURL directive cannot be ruled out; refusing to deploy")
+                  body = path.read_bytes()
+                  if b"sourceMappingURL" in body:
+                      fail(f"a served bundle still carries a sourceMappingURL directive under {base.name}")
+          cache = root / ".next" / "cache"
+          if cache.is_symlink():
+              fail("the .next/cache path is a symbolic link")
+          if cache.is_dir() and any(path.is_file() for path in cache.rglob("*.map")):
+              fail("a source map was written under .next/cache")
+          print(f"source-map staging verified: {len(files) - 1} maps; .next/.vercel/output carry no maps or pointers")
+          PY
+
+      - name: Upload the private source-map artifact before deployment
+        if: ${{ inputs.source_map_capture && github.repository == 'josephasmith1/dermalactives-mx' && github.repository_id == 1286557000 && github.event.repository.id == 1286557000 && github.event.repository.private == true && github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.environment == 'production' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          # A single non-wildcard directory path becomes the artifact root (upload-artifact
+          # v4.6.2 src/shared/search.ts returns rootDirectory = searchPaths[0]), so the downloaded
+          # archive is exactly maps.manifest.json + maps/**, never a nested directory or an inner zip.
+          name: dermalactives-mx-sourcemaps-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/source-maps/dermalactives-mx/run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: false
+
+      - name: Deploy the prebuilt output
+        env:
+          VERCEL_ORG_ID: ${{ inputs.vercel_org_id }}
+          VERCEL_PROJECT_ID: ${{ inputs.vercel_project_id }}
+          VERCEL: "1"
+          VERCEL_ENV: ${{ inputs.environment }}
+          VERCEL_GIT_COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # Deployment Vercel already created for this commit since this step started:
+          # "<state> https://<url>", "" when there is none, or "UNKNOWN lookup-failed" when the API call fails.
+          deploy_started_ms="$(( $(date +%s) * 1000 ))"
+          existing_deployment() {
+            local target_q=""
+            if [ "$VERCEL_ENV" = "production" ]; then target_q="&target=production"; fi
+            curl -fsS --max-time 20 -H "Authorization: Bearer $VERCEL_TOKEN" \
+              "https://api.vercel.com/v6/deployments?projectId=${VERCEL_PROJECT_ID}&teamId=${VERCEL_ORG_ID}&sha=${VERCEL_GIT_COMMIT_SHA}&since=${deploy_started_ms}&limit=5${target_q}" \
+              | jq -r '[.deployments[] | select(.meta.githubCommitSha == env.VERCEL_GIT_COMMIT_SHA)]
+                       | sort_by(.created) | last
+                       | if . == null then "" else "\(.state // .readyState) https://\(.url)" end' \
+              || echo "UNKNOWN lookup-failed"
+          }
+          deploy_prebuilt() {
+            local attempt found state url poll
+            for attempt in 1 2 3; do
+              # Each attempt is bounded: the CLI waits for the deployment to be ready and never
+              # gives up on its own (2026-10-04: two previews held a runner 44 min each).
+              if [ "$VERCEL_ENV" = "production" ]; then
+                timeout --kill-after=30 600 vercel deploy --prebuilt --prod --archive=tgz > "$RUNNER_TEMP/deploy-url.txt" && return 0
+              else
+                timeout --kill-after=30 600 vercel deploy --prebuilt --archive=tgz > "$RUNNER_TEMP/deploy-url.txt" && return 0
+              fi
+              echo "prebuilt deploy attempt ${attempt} failed"
+              # The CLI can fail AFTER Vercel has created (and, with --prod, promoted) the
+              # deployment: 2026-10-06 dermalactives-ecommerce run 37550444323 uploaded 632MB,
+              # printed "Error: fetch failed" on all 3 attempts, and failed the job while
+              # dpl_ApvsjMgDPWh37rNXvPCWzNKLqAWa was READY in production. Adopt that deployment
+              # instead of failing or uploading a duplicate; wait while it is still building.
+              # Once Vercel has created a deployment for this commit, never upload again: the build
+              # carries NEXT_DEPLOYMENT_ID, and Vercel rejects a second deployment with the same ID
+              # ("A deployment with the user-configured deploymentId ... already exists").
+              # 2026-11-05 dermalactives-ecommerce run 42078474067: the deployment sat QUEUED past
+              # the old 8-minute wait, both re-uploads were refused, and the job failed while the
+              # deployment later went READY. So wait for the one that exists (up to 20 minutes).
+              for poll in $(seq 1 60); do
+                # Stop waiting with our own error before the 60-minute job limit kills the step.
+                if [ $(( $(date +%s) - deploy_started_ms / 1000 )) -gt 2700 ]; then
+                  echo "::error::the deployment for this commit was still ${state:-unknown} after 45 minutes in this step."
+                  return 1
+                fi
+                found="$(existing_deployment)"
+                state="${found%% *}"
+                url="${found#* }"
+                case "$state" in
+                  READY)
+                    echo "$url" > "$RUNNER_TEMP/deploy-url.txt"
+                    echo "::warning::vercel deploy reported a failure, but Vercel created $url for this commit and it is READY; using it."
+                    return 0
+                    ;;
+                  BUILDING | INITIALIZING | QUEUED | UNKNOWN)
+                    echo "deployment for this commit is $state; waiting (${poll}/60)"
+                    sleep 20
+                    ;;
+                  "")
+                    # No deployment was created, so a new upload can use the ID.
+                    break
+                    ;;
+                  *)
+                    echo "::error::Vercel created $url for this commit and it ended $state. A new upload would reuse its deployment ID and be refused."
+                    return 1
+                    ;;
+                esac
+              done
+              if [ -n "$state" ]; then
+                echo "::error::the deployment for this commit was still $state after 20 minutes of waiting."
+                return 1
+              fi
+              sleep 20
+            done
+            return 1
+          }
           deploy_prebuilt
           URL="$(grep -Eo 'https://[^ ]+' "$RUNNER_TEMP/deploy-url.txt" | tail -1)"
           if [ -z "$URL" ]; then echo "deploy did not print a URL"; exit 1; fi
-          echo "url=$URL" >> "$GITHUB_OUTPUT"
           echo "deployment_url=$URL" >> "$GITHUB_ENV"
 
       - name: Record the GitHub deployment
